@@ -421,6 +421,8 @@ The host prepends supported public `user-questions/request` and `approval/reques
 - Each card uses the request UUID. Stale clicks, replayed replies, foreign observer capabilities, and wrong-session answers are rejected. The UI retains its draft and card until the matching host resolution, not merely until a button is clicked or a transport write succeeds.
 - Cancellation, tool completion, turn completion, session disposal, and lease loss revoke pending identities. Known turn IDs prevent a delayed old-turn Stop from clearing a newer question. If delegation fails, the native observer closes so an invisible claimed request cannot remain stuck in DSH.
 
+The interaction endpoint requires only the host's public `webApp` service. Current DSH hosts expose `connection` on the client, not the host. Its absence must not disable the native interaction lease. Older hosts can additionally use their host-side connection for precise PWA focus, independently of approval delivery.
+
 The private protocol starts with `observe_interactions`, exchanges leased `interaction_ping` / `interaction_pong` frames, and sends typed pending/resolved interaction frames. A separate `respond_interaction` command carries the observer capability, exact session/request IDs, and explicit answers or a single-request decision. It is private to the current OS user and does not use browser authentication tokens. Plan presentation is bounded to fit the local frame budget without silently truncating the text a user is asked to approve.
 
 ### Results and completion cards

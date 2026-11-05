@@ -165,17 +165,17 @@ async function installedRuntime() {
   try {
     const require = process.env.DSH_PACKAGE_ROOT ? createRequire(join(process.env.DSH_PACKAGE_ROOT, 'package.json')) : createRequire(import.meta.url)
     const load = async name => import(pathToFileURL(require.resolve(`@deepseek-ai/${name}`)).href)
-    const [{ Context }, { default: SessionStore }, { UserQuestionService }, { ApprovalService }, { PlanModeController }, { AgentRegistry }] = await Promise.all([
-      load('cordis'), load('dsh-session'), load('dsh-user-questions'), load('dsh-user-approval'), load('dsh-plan-mode'), load('dsh-agent'),
+    const [{ Context }, { default: SessionStore }, { UserQuestionService }, { ApprovalService }, { PlanModeController }, { AgentRegistry }, { SessionProjectionRegistry }] = await Promise.all([
+      load('cordis'), load('dsh-session'), load('dsh-user-questions'), load('dsh-user-approval'), load('dsh-plan-mode'), load('dsh-agent'), load('dsh-session-projection'),
     ])
-    return { Context, SessionStore, UserQuestionService, ApprovalService, PlanModeController, AgentRegistry }
+    return { Context, SessionStore, UserQuestionService, ApprovalService, PlanModeController, AgentRegistry, SessionProjectionRegistry }
   } catch (error) {
     if (process.env.DSH_PACKAGE_ROOT) throw error
   }
 }
 const runtime = await installedRuntime()
 
-test('actual host plugin publishes endpoint and cancels cards on terminal results and unload', {
+test('current host without legacy connection publishes approvals and cancels cards on results and unload', {
   skip: !runtime && 'Set DSH_PACKAGE_ROOT for published host integration',
 }, async t => {
   const { Context, SessionStore, UserQuestionService } = runtime
@@ -198,12 +198,14 @@ test('actual host plugin publishes endpoint and cancels cards on terminal result
   const ctx = new Context()
   t.after(() => ctx.fiber.dispose())
   await ctx.plugin(SessionStore).inertia
+  await ctx.plugin(runtime.SessionProjectionRegistry).inertia
   const session = ctx.sessions.create('actual-host-session')
   const agent = { id: session.id, ctx, session }
   await ctx.plugin(runtime.AgentRegistry).inertia
   await ctx.agents.register(agent)
-  ctx.provide('connection', { browserPeer: {}, rpc: { handle: () => () => {} } })
+  // Current DSH exposes WebApp on the host, but connection is client-only.
   ctx.provide('webApp', { getAdvertisedUrl: () => 'http://127.0.0.1:3080/' })
+  await ctx.plugin(runtime.ApprovalService, { policy: 'ask' }).inertia
   await ctx.plugin(UserQuestionService).inertia
   let nativeCalls = 0
   ctx.on('user-questions/request', () => {
@@ -217,12 +219,33 @@ test('actual host plugin publishes endpoint and cancels cards on terminal result
   const observer = await observe(endpoint)
   t.after(() => observer.socket.destroy())
   session.append('turn/start', { turn: 1 })
+  for (const decision of ['allowed-once', 'rejected', 'cancelled', 'never']) {
+    const callId = `approval-${decision}`
+    const signal = new AbortController()
+    const count = observer.frames.filter(frame => frame.interaction?.status === 'pending').length
+    if (decision === 'never') session.append('approval/policy', { policy: 'never' })
+    const waiting = ctx.approval.request({ agent, toolName: 'write', callId,
+      reason: 'Allow writing outside the workspace?', signal: signal.signal })
+    if (decision !== 'never') {
+      await until(() => observer.frames.some(frame => frame.interaction?.call_id === callId))
+      const pending = observer.frames.find(frame => frame.interaction?.call_id === callId).interaction
+      assert.equal(pending.kind, 'approval')
+      assert.equal(pending.tool_name, 'write')
+      assert.equal(pending.turn_id, 1)
+      if (decision === 'cancelled') signal.abort()
+      else assert.deepEqual(await command(endpoint, { type: 'respond_interaction', observer_id: observer.observerID,
+        session_id: session.id, request_id: pending.request_id, decision }), { ok: true })
+    }
+    assert.equal(await waiting, decision === 'never' ? 'rejected' : decision)
+    if (decision === 'never') {
+      assert.equal(observer.frames.filter(frame => frame.interaction?.status === 'pending').length, count)
+    }
+  }
   session.append('tool/call', { turn: 1, step: 1, callId: 'actual-question-call', name: 'ask_user_question', arguments: JSON.stringify({ questions }) })
   const result = ctx.userQuestions.ask({ agent, questions })
   const settled = result.then(value => ({ value }), error => ({ error }))
-  await until(() => observer.frames.some(frame => frame.interaction?.status === 'pending'))
-  assert.equal(observer.frames.find(frame => frame.interaction).interaction.call_id, 'actual-question-call')
-  assert.equal(observer.frames.find(frame => frame.interaction).interaction.turn_id, 1)
+  await until(() => observer.frames.some(frame => frame.interaction?.call_id === 'actual-question-call'))
+  assert.equal(observer.frames.find(frame => frame.interaction?.kind === 'question').interaction.turn_id, 1)
   session.append('tool/result', { turn: 1, step: 1, message: { id: 'actual-result', role: 'tool',
     source: { kind: 'tool', callId: 'actual-question-call' }, toolCallId: 'actual-question-call', content: [],
   } }, { surfaceOp: 'append' })
@@ -231,7 +254,8 @@ test('actual host plugin publishes endpoint and cancels cards on terminal result
   assert.equal(observer.frames.find(frame => frame.interaction?.status === 'resolved').interaction.turn_id, 1)
   const unloading = ctx.userQuestions.ask({ agent, questions })
   const unloaded = unloading.then(value => ({ value }), error => ({ error }))
-  await until(() => observer.frames.filter(frame => frame.interaction?.status === 'pending').length === 2)
+  await until(() => observer.frames.filter(frame => frame.interaction?.status === 'pending'
+    && frame.interaction.kind === 'question').length === 2)
   await host.dispose()
   assert.equal((await unloaded).error.code, 'ASK_ABORTED')
   assert.equal(nativeCalls, 0)
@@ -244,6 +268,7 @@ test('published DSH services preserve native waterfall fallback, approval audit 
   const ctx = new Context()
   t.after(() => ctx.fiber.dispose())
   await ctx.plugin(SessionStore).inertia
+  await ctx.plugin(runtime.SessionProjectionRegistry).inertia
   const session = ctx.sessions.create('synthetic-approval-session')
   const agent = { id: 'synthetic-root', session, ctx }
   ctx.provide('agents', { get: id => id === agent.id ? agent : undefined, roots: () => [agent] })
@@ -303,7 +328,7 @@ test('published DSH services preserve native waterfall fallback, approval audit 
   let planTool
   ctx.provide('tools', { register: tool => { planTool = tool } })
   ctx.provide('systemPrompt', { section() {}, context() {}, getSectionOrder: () => 0, getContextOrder: () => 0 })
-  ctx.provide('sessionProjections', { register() {}, stateOf: () => ({ active: true }) })
+  session.append('plan/mode', { active: true })
   await ctx.plugin(PlanModeController, { section: 'Synthetic plan test guidance' }).inertia
   const markdown = '# Synthetic plan\n' + 'Full plan detail.\n'.repeat(20000)
   for (const approved of [true, false]) {

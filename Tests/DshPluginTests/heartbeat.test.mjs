@@ -8,12 +8,14 @@ import test from 'node:test'
 let cordisURL
 let sessionURL
 let agentURL
+let projectionURL
 try {
   const require = process.env.DSH_PACKAGE_ROOT
     ? createRequire(join(process.env.DSH_PACKAGE_ROOT, 'package.json')) : createRequire(import.meta.url)
   cordisURL = pathToFileURL(require.resolve('@deepseek-ai/cordis')).href
   sessionURL = pathToFileURL(require.resolve('@deepseek-ai/dsh-session')).href
   agentURL = pathToFileURL(require.resolve('@deepseek-ai/dsh-agent')).href
+  projectionURL = pathToFileURL(require.resolve('@deepseek-ai/dsh-session-projection')).href
 } catch (error) {
   if (process.env.DSH_PACKAGE_ROOT) throw error
 }
@@ -27,9 +29,11 @@ test('loaded sessions and an unavailable bridge never keep a host process alive'
     import { Context } from ${JSON.stringify(cordisURL)}
     import SessionStore from ${JSON.stringify(sessionURL)}
     import AgentRegistry from ${JSON.stringify(agentURL)}
+    import SessionProjectionRegistry from ${JSON.stringify(projectionURL)}
     import * as observer from ${JSON.stringify(pluginURL)}
     const ctx = new Context()
     await ctx.plugin(SessionStore).inertia
+    await ctx.plugin(SessionProjectionRegistry).inertia
     const session = ctx.sessions.create('live-at-exit', { meta: { cwd: '/workspace' } })
     await ctx.plugin(AgentRegistry).inertia
     await ctx.agents.register({ id: session.id, session, ctx })

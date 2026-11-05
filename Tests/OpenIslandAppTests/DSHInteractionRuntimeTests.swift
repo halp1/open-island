@@ -94,19 +94,20 @@ struct DSHInteractionRuntimeTests {
     const [pluginPath, socketPath] = process.argv.slice(2)
     const require = createRequire(join(process.env.DSH_PACKAGE_ROOT, 'package.json'))
     const load = name => import(pathToFileURL(require.resolve('@deepseek-ai/' + name)).href)
-    const [{ Context }, { default: SessionStore }, { AgentRegistry }, { UserQuestionService }, { ApprovalService }, { PlanModeController }, plugin] = await Promise.all([
-      load('cordis'), load('dsh-session'), load('dsh-agent'), load('dsh-user-questions'), load('dsh-user-approval'), load('dsh-plan-mode'), import(pathToFileURL(pluginPath).href),
+    const [{ Context }, { default: SessionStore }, { AgentRegistry }, { UserQuestionService }, { ApprovalService }, { PlanModeController }, { SessionProjectionRegistry }, plugin] = await Promise.all([
+      load('cordis'), load('dsh-session'), load('dsh-agent'), load('dsh-user-questions'), load('dsh-user-approval'), load('dsh-plan-mode'), load('dsh-session-projection'), import(pathToFileURL(pluginPath).href),
     ])
     const ctx = new Context()
     // The real Web host owns a referenced HTTP server. Keep this disposable
     // host alive while the observer and explicit UI response are in flight.
     const keepAlive = setInterval(() => {}, 1000)
     await ctx.plugin(SessionStore).inertia
+    await ctx.plugin(SessionProjectionRegistry).inertia
     await ctx.plugin(AgentRegistry).inertia
     const session = ctx.sessions.create('native-roundtrip-session')
     const agent = { id: session.id, session, ctx }
     await ctx.agents.register(agent)
-    ctx.provide('connection', { browserPeer: {}, rpc: { handle: () => () => {} } })
+    // Current Web hosts have no legacy host-side connection service.
     ctx.provide('webApp', { getAdvertisedUrl: () => 'http://127.0.0.1:3080/' })
     await ctx.plugin(UserQuestionService).inertia
     await ctx.plugin(ApprovalService, { policy: 'ask' }).inertia
@@ -134,7 +135,7 @@ struct DSHInteractionRuntimeTests {
       let planTool
       ctx.provide('tools', { register: tool => { planTool = tool } })
       ctx.provide('systemPrompt', { section() {}, context() {}, getSectionOrder: () => 0, getContextOrder: () => 0 })
-      ctx.provide('sessionProjections', { register() {}, stateOf: () => ({ active: true }) })
+      session.append('plan/mode', { active: true })
       await ctx.plugin(PlanModeController, { section: 'Synthetic plan test' }).inertia
       const plan = '# Native review\n\nKeep exact identities.\n\n## Verification\n\nTest cancellation and stale answers.\n'
       session.append('tool/call', { turn: 1, step: 2, callId: 'plan-call', name: 'exit_plan_mode', arguments: JSON.stringify({ plan }) })

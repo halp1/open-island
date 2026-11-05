@@ -20,10 +20,10 @@ async function runtime() {
   try {
     const require = process.env.DSH_PACKAGE_ROOT ? createRequire(join(process.env.DSH_PACKAGE_ROOT, 'package.json')) : createRequire(import.meta.url)
     const load = async name => import(pathToFileURL(require.resolve(`@deepseek-ai/${name}`)).href)
-    const [{ Context }, { default: SessionStore }, { AgentRegistry }, { UserQuestionService }, { ApprovalService }, { scopeTarget }] = await Promise.all([
-      load('cordis'), load('dsh-session'), load('dsh-agent'), load('dsh-user-questions'), load('dsh-user-approval'), load('dsh-scope'),
+    const [{ Context }, { default: SessionStore }, { AgentRegistry }, { UserQuestionService }, { ApprovalService }, { scopeTarget }, { SessionProjectionRegistry }] = await Promise.all([
+      load('cordis'), load('dsh-session'), load('dsh-agent'), load('dsh-user-questions'), load('dsh-user-approval'), load('dsh-scope'), load('dsh-session-projection'),
     ])
-    return { Context, SessionStore, AgentRegistry, UserQuestionService, ApprovalService, scopeTarget }
+    return { Context, SessionStore, AgentRegistry, UserQuestionService, ApprovalService, scopeTarget, SessionProjectionRegistry }
   } catch (error) {
     if (process.env.DSH_PACKAGE_ROOT) throw error
   }
@@ -69,6 +69,7 @@ test('published registry excludes children before and after registration, suppre
   const ctx = new Context()
   t.after(() => ctx.fiber.dispose())
   await ctx.plugin(SessionStore).inertia
+  await ctx.plugin(api.SessionProjectionRegistry).inertia
   ctx.provide('connection', { browserPeer: {}, rpc: { handle: () => () => {} } })
   ctx.provide('webApp', { getAdvertisedUrl: () => 'http://127.0.0.1:3080/' })
   const rootSession = ctx.sessions.create('root-late-registration', { meta: { parentSession: 'fork-ancestor' } })

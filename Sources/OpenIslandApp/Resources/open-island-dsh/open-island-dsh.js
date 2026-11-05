@@ -682,8 +682,10 @@ export function apply(ctx, config = {}) {
     return interactions.request('approval', request, next)
   }, { prepend: true })
 
-  // Web services are optional. Root classification still requires public Agents.
-  ctx.inject(['connection', 'webApp'], webCtx => {
+  // The interaction socket needs only the host's public WebApp service.
+  // Current DSH provides connection on the client only. Waiting for it here
+  // silently disables every approval and question card on current hosts.
+  ctx.inject(['webApp'], webCtx => {
     webCtx.effect(() => {
       let cancelled = false
       let relay
@@ -695,8 +697,10 @@ export function apply(ctx, config = {}) {
       }).then(async value => {
         relay = value
         if (cancelled) return
-        const connection = webCtx.connection
-        unregister = connection.rpc.handle(FOCUS_CHANNEL, async (endpoint, payload, signal, peer) => {
+        // Older hosts can additionally relay precise browser focus. Its absence
+        // must not gate the private native interaction subscription.
+        const connection = webCtx.get('connection')
+        unregister = connection?.rpc?.handle(FOCUS_CHANNEL, async (endpoint, payload, signal, peer) => {
           if (peer !== connection.browserPeer) return { ok: false, error: { code: 'FORBIDDEN', message: 'Owner browser required', details: {} } }
           return { ok: true, value: await relay.rpc(endpoint, payload, signal) }
         })

@@ -154,7 +154,8 @@ async function installedRuntime() {
     const { Context } = await import(pathToFileURL(require.resolve('@deepseek-ai/cordis')).href)
     const { default: SessionStore, Session } = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-session')).href)
     const { AgentRegistry } = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-agent')).href)
-    return { Context, SessionStore, Session, AgentRegistry }
+    const { SessionProjectionRegistry } = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-session-projection')).href)
+    return { Context, SessionStore, Session, AgentRegistry, SessionProjectionRegistry }
   } catch (error) {
     if (process.env.DSH_PACKAGE_ROOT) throw error
     return undefined
@@ -164,6 +165,7 @@ async function installedRuntime() {
 const runtime = await installedRuntime()
 
 async function registerFixtureRoots(ctx) {
+  await ctx.plugin(runtime.SessionProjectionRegistry).inertia
   await ctx.plugin(runtime.AgentRegistry).inertia
   const owners = new Map()
   ctx.on('session/created', session => {

@@ -20,10 +20,10 @@ async function installedRuntime() {
   try {
     const require = process.env.DSH_PACKAGE_ROOT ? createRequire(join(process.env.DSH_PACKAGE_ROOT, 'package.json')) : createRequire(import.meta.url)
     const load = async name => import(pathToFileURL(require.resolve(`@deepseek-ai/${name}`)).href)
-    const [{ Context }, { default: SessionStore }, { UserQuestionService, UserQuestionError }, { PlanModeController }, askTool, { AgentRegistry }] = await Promise.all([
-      load('cordis'), load('dsh-session'), load('dsh-user-questions'), load('dsh-plan-mode'), load('dsh-tool-ask-user'), load('dsh-agent'),
+    const [{ Context }, { default: SessionStore }, { UserQuestionService, UserQuestionError }, { PlanModeController }, askTool, { AgentRegistry }, { SessionProjectionRegistry }] = await Promise.all([
+      load('cordis'), load('dsh-session'), load('dsh-user-questions'), load('dsh-plan-mode'), load('dsh-tool-ask-user'), load('dsh-agent'), load('dsh-session-projection'),
     ])
-    return { Context, SessionStore, UserQuestionService, UserQuestionError, PlanModeController, askTool, AgentRegistry }
+    return { Context, SessionStore, UserQuestionService, UserQuestionError, PlanModeController, askTool, AgentRegistry, SessionProjectionRegistry }
   } catch (error) {
     if (process.env.DSH_PACKAGE_ROOT) throw error
   }
@@ -54,6 +54,7 @@ test('published question and plan executions expose terminal outcomes after nati
   const ctx = new Context()
   t.after(() => ctx.fiber.dispose())
   await ctx.plugin(SessionStore).inertia
+  await ctx.plugin(runtime.SessionProjectionRegistry).inertia
   const session = ctx.sessions.create('published-results-session')
   const agent = { id: session.id, session, ctx }
   await ctx.plugin(runtime.AgentRegistry).inertia
@@ -61,7 +62,6 @@ test('published question and plan executions expose terminal outcomes after nati
   const definitions = new Map()
   ctx.provide('tools', { register: tool => definitions.set(tool.name, tool) })
   ctx.provide('systemPrompt', { section() {}, getSectionOrder: () => 0 })
-  ctx.provide('sessionProjections', { register() {}, stateOf: () => ({ active: true }) })
   await ctx.plugin(UserQuestionService).inertia
   await ctx.plugin(PlanModeController, { section: 'Synthetic test guidance' }).inertia
   await ctx.plugin(askTool, { mode: 'legacy' }).inertia
@@ -87,6 +87,7 @@ test('published question and plan executions expose terminal outcomes after nati
     const definition = definitions.get(name)
     const args = item.plan ? { plan: '# Synthetic plan\nDo synthetic work.' } : { questions: [question] }
     session.append('turn/start', { turn })
+    if (item.plan) session.append('plan/mode', { active: true })
     session.append('assistant/message', { turn, step: 1, message: { id: `preamble-${turn}`, role: 'assistant',
       source: { kind: 'model', provider: 'synthetic', model: 'test' },
       content: [{ type: 'text', text: 'private-preamble' }, { type: 'reasoning', text: 'private-reasoning' }],
