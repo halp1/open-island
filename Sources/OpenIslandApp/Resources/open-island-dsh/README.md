@@ -1,6 +1,6 @@
 # Open Island DSH companion
 
-Dependency-free host and browser companion for DSH 0.2.1-rc.3 and compatible 0.2 releases. It observes live sessions and relays one narrow action: select a conversation in the installed DSH Web PWA and focus its composer. No build step, subprocess hook, or live user configuration change is required to prepare the package.
+Dependency-free host and browser companion for DSH 0.2.1-rc.3 and compatible 0.2 releases. It observes live sessions, focuses the installed DSH Web PWA, and relays explicit human question, plan-review, and one-shot approval decisions through a private leased connection. No build step, subprocess hook, or live user configuration change is required to prepare the package.
 
 ## Install explicitly
 
@@ -14,7 +14,7 @@ dsh plugin --profile web add "file:$PWD/Sources/OpenIslandApp/Resources/open-isl
 
 Use the actual profile name for other hosts. Restart that profile if it does not support host plugin reload. This command changes the selected DSH profile only when a person runs it.
 
-The app installer reconstructs a persistent managed package from the bundled JavaScript and generated Cordis metadata. It registers the bundle in the existing profile manifest without running `dsh plugin` or rewriting user YAML. Its managed package name is `open-island-dsh`. SwiftPM may flatten the source resources, so installation does not depend on the original package directory surviving in the app bundle.
+The app installer reconstructs a persistent managed package from the bundled JavaScript and generated Cordis metadata. Its canonical source is stored under `open-island-plugins/open-island-dsh` in the profile, outside package-manager-controlled `node_modules`. It registers the bare bundle name and exactly one owned `link:./open-island-plugins/open-island-dsh` dependency, with an exact-target `node_modules/open-island-dsh` link. This survives dependency reconciliation instead of relying on an extraneous copied package. It does not run `dsh plugin`, rewrite unrelated dependencies, change user YAML, or run package scripts. Its managed package name is `open-island-dsh`. SwiftPM may flatten the source resources, so installation does not depend on the original package directory surviving in the app bundle.
 
 Remove a managed installation through Open Island Settings. Remove a direct package installation with:
 
@@ -26,11 +26,13 @@ dsh plugin --profile web remove open-island-dsh
 
 The Cordis entry exports `name`, `inject = ['sessions']`, and `apply(ctx, config)`. It uses `ctx.on`, `ctx.effect`, `ctx.sessions.list()`, and `ctx.sessions.get(id)`. Session metadata uses `session.id`, `session.header.cwd`, and the incremental `session.requestHeader()` fold.
 
-It subscribes to `session/created`, `session/event`, and `session/disposed`. Initial enumeration includes only loaded live Session objects. Detached persisted sessions and the host process itself never produce heartbeats. Each live Session object owns its heartbeat timer, tool-call correlation, model metadata, and latest assistant text. A disposed object cannot be revived by another session reusing its id. Plugin unload ends all observed sessions and clears every timer.
+It subscribes to `session/created`, `session/event`, `session/disposed`, `agent/created`, and `agent/disposed`. Only proven top-level agents are observed. Proof requires `agents.get(session.id)` to return the exact live agent for that Session object and `agents.roots()` to contain that agent. Immutable `session.header.origin === 'subagent'` or positive `delegationDepth` always excludes the session, even if resumed as a runtime root. `parentSession` alone is fork lineage and does not exclude a proven root. Unknown sessions, including SessionStore entries created before agent publication or profiles without the public Agents service, produce no activity and wait for classification. Titles, prompts, and tool names are never used to infer ownership.
+
+Initial enumeration includes only loaded live Session objects and does not replay pre-classification events. Each proven root Session object owns its heartbeat timer, tool-call correlation, model metadata, and latest assistant text. Agent or session disposal ends that exact observation. Reclassification as a child clears its timers and pending interactions. A disposed object cannot be revived by another session reusing its id. Plugin unload ends all observed roots and clears every timer.
 
 | DSH event | Open Island lifecycle |
 | --- | --- |
-| Session creation or existing live session at plugin load | `SessionStart` |
+| Exact root agent confirmed at publication or plugin load | `SessionStart` |
 | `user/message` with `source.kind = 'user'` | `UserPromptSubmit` |
 | `tool/call` | `PreToolUse` |
 | `tool/result` | `PostToolUse` |
@@ -38,7 +40,9 @@ It subscribes to `session/created`, `session/event`, and `session/disposed`. Ini
 | Timer while exact Session object remains in the store | `Heartbeat` |
 | Session disposal or plugin unload | `SessionEnd` |
 
-Injected context is not a user prompt. Assistant reasoning, attachments, and tool outputs are not forwarded. Text previews and raw tool argument strings are capped at 4096 characters. The session id is the native DSH id, without an extra prefix. No guessed terminal or process identity is attached to Web sessions.
+Every normal root payload carries `is_subagent: false`. A known child sends only one exclusion tombstone per Session object and plugin lifetime: `SessionEnd` with `is_subagent: true`, `session_id`, `cwd`, and optional `parent_session_id` from its public immutable header. Native code must consume this before ordinary lifecycle processing, silently remove any older persisted child row, and never notify, create a card, or show completion. Children emit no starts, heartbeats, metadata, tool observations, outcomes, or completion text. Their question and approval waterfalls are left to native DSH. A public question service may itself reject an owned child with `DELEGATED_CALLER` before dispatch.
+
+Injected context is not a user prompt. Assistant reasoning, attachments, and tool outputs are not forwarded. Prompt previews and raw tool argument strings are capped at 4096 characters. Final visible assistant markdown is preserved up to 16 KiB with a UTF-8-safe boundary. The session id is the native DSH id, without an extra prefix. No guessed terminal or process identity is attached to Web sessions.
 
 ## Bridge transport
 
@@ -48,7 +52,7 @@ Each observation is one newline-terminated JSON command:
 {"type":"command","command":{"type":"processDshHook","dshHook":{"hook_event_name":"PreToolUse","session_id":"session-id","cwd":"/workspace","model":"deepseek/model-id","tool_name":"bash","tool_input":"{\"command\":\"pwd\"}"}}}
 ```
 
-The snake_case payload follows the Pi lifecycle contract without its `agent` field. Optional fields are `prompt`, `tool_name`, `tool_input`, `last_assistant_message`, and `model`. `Stop` describes turn completion, not session disposal.
+The snake_case payload follows the Pi lifecycle contract without its `agent` field. Optional fields are `prompt`, `tool_name`, `tool_input`, `last_assistant_message`, `model`, `turn_id`, `turn_outcome`, and `interaction_result`. `Stop` describes turn completion, not session disposal. `turn_id` is the public session event's exact `turn` integer, remembered between events. It is also present inside pending and resolved interaction frames when known. `turn_outcome` on Stop preserves exact public `reason.kind`: `completed`, `aborted`, `error`, `blocked`, `max-tokens`, `interrupted`, `forked`, or a bounded plugin-defined kind. Unknown reasons must not become a successful completion claim. No historical events are replayed on attachment.
 
 Socket selection matches `BridgeSocketLocation.currentURL`: `OPEN_ISLAND_SOCKET_PATH`, then `VIBE_ISLAND_SOCKET_PATH`, then the per-user `Library/Application Support/OpenIsland/bridge.sock`. There is no automatic fallback to the old temporary socket.
 
@@ -58,7 +62,9 @@ Optional Cordis row settings are `socketPath` and `heartbeatIntervalMs`. `OPEN_I
 
 ## Safety and limitations
 
-DSH exposes committed `approval/asked` and `approval/decided` audit events. Its `approval/request` and `user-questions/ask` APIs are answerer waterfalls, not passive notification feeds. The companion does not register either waterfall, answer questions, grant approvals, switch policies, control tools, or execute arbitrary UI scripts. The only native command accepted is conversation focus.
+DSH exposes committed `approval/asked` and `approval/decided` audit events. Its `approval/request` and `user-questions/request` APIs are answerer waterfalls, not passive notification feeds. The companion prepends an answerer that claims requests only while one native app observer holds a live lease and the exact calling agent is a live runtime root. The app must collect an explicit human decision. The companion never grants automatically, changes approval or sandbox policy, or executes arbitrary UI scripts. DSH's service-level `never` approval policy rejects before invoking any answerer, including this companion.
+
+Timed questions (`request.wait.timed`) remain in native DSH. Supporting their foreground countdown requires a separate public `userQuestions.attachWait` claim and their late replies require `userQuestions.answer`. This first slice does neither. Missing apps, oversized or unsupported questions, and missing live root identity delegate unchanged to native DSH. Tool calls and injected user context never become synthetic answers. No historical interaction is replayed when the plugin loads.
 
 Session end delivery is best-effort during abrupt process exit. A session that remains loaded in a Web host is live even when its browser tab is disconnected. Unloading this plugin emits `SessionEnd` for its observation lifetime even if DSH itself continues running. Reload emits a new start. Historical prompts and in-flight tool calls are not replayed on plugin attachment. Transcript paths and exact terminal jump metadata are not available through the session APIs used here and are omitted. Delivery is not acknowledged or persisted.
 
@@ -71,7 +77,7 @@ The package and Cordis patch identity are `open-island-dsh`. The package exports
 - `@deepseek-ai/dsh-client-ui-workspace`
 - `@deepseek-ai/dsh-client-ui-conversation`
 
-The client requires services `connection`, `sessions`, `uiWorkspace`, and `conversation`. Host `connection` and `webApp` are optional, so sessions-only CLI profiles retain lifecycle observation without a focus listener.
+The client requires services `connection`, `sessions`, `uiWorkspace`, and `conversation`. Host `connection` and `webApp` are optional, so CLI profiles with the public Agents service retain root-only lifecycle observation without a focus listener. Session-only profiles remain silent because they cannot prove root ownership.
 
 Web hosts publish optional lifecycle fields only after the endpoint is ready:
 
@@ -97,6 +103,54 @@ Only standalone, fullscreen, or minimal-ui display modes register. Fullscreen is
 Clients report focus epochs through one-second polls. The host selects the most recently focused eligible client, never broadcasts to all tabs, and expires registrations after 3.5 seconds without a poll. A cold client can register while a request waits. Once delivered, a request is not redirected to a different client.
 
 The client calls public `uiWorkspace.openSession(id)`, borrows `sessions.scope(id)`, and calls `conversation.input.for(scope).focus()`. It yields to rendering and retries for a mounted editor. Success requires the target to retain its public `mainView` reference, a focused document, and the composer to hold keyboard focus. Newer selections invalidate older asynchronous focus work. Drafts are never modified.
+
+## Interactive decision protocol
+
+The same private focus endpoint also accepts one host-wide observer. It is not an HTTP endpoint and requires the same verified owner and private filesystem permissions. Subscribe with one NDJSON line:
+
+```json
+{"type":"observe_interactions","protocol_version":1,"observer_id":"client-generated-uuid-v4"}
+```
+
+The host replies with `interaction_ready`, protocol version 1, and the exact `observer_id`. A second observer receives `busy`. Every second the host sends `interaction_ping` with `observer_id` and a random `nonce`. Reply with `interaction_pong` and both exact values. Four seconds without a valid pong revokes the lease and closes the stream. All sockets and timers remain unreferenced.
+
+One frame presents each claimed request:
+
+```json
+{"type":"interaction","session_id":"native-dsh-session","interaction":{"request_id":"host-generated-uuid-v4","kind":"question","status":"pending","call_id":"optional-tool-call","questions":[{"id":"choice","question":"Which option?","options":[{"label":"A"}],"multiSelect":false}]}}
+```
+
+Kinds are `question`, `plan`, and `approval`. Question fields preserve the public DSH service vocabulary, including `detail`, `header`, `multiSelect`, and `intent`. A plan question preserves its complete markdown `detail` and `intent: {kind: "plan-review", approve: "Approve", callId: "..."}`. The native app presents plans as questions, never tool permissions. Approval presentations carry `tool_name`, optional `call_id`, and optional `reason`. Request IDs are fresh UUIDs, not approval audit IDs. The public approval callback does not carry its audit ID.
+
+Send a response on a separate one-shot connection:
+
+```json
+{"type":"respond_interaction","observer_id":"current-observer-uuid","session_id":"native-dsh-session","request_id":"host-request-uuid","answers":[{"id":"choice","selected":["A"],"custom":"optional feedback"}]}
+```
+
+Approval responses instead carry `decision: "allowed-once"` or `decision: "rejected"`. Any kind may carry `decision: "delegate"` to transfer to native DSH. A successful response acknowledges `{"ok":true}`. Invalid input, stale identity, replay, or another observer's capability returns `{"ok":false,"error":"invalid-request"}` or `stale-request` without changing the pending request. Answers must name every question exactly once, select actual offered labels, avoid duplicate labels, and respect single-select. An empty selection without custom text is an explicit skipped answer, not a timeout or a grant.
+
+The observer receives the same request identity with `status: "resolved"` and `resolution: "answered"`, `delegate`, or `cancelled`. The host removes the pending ID before publishing resolution or invoking native `next()`. It never races a native answerer against the app. Observer disconnect or lease expiry revokes all IDs before scheduling native fallback. Request abort, owning session disposal, turn end, or a correlated terminal tool result cancels ownership. The app clears cards when the stream closes. Reusing a session ID or reconnecting cannot revive an old decision.
+
+The stream has at most 128 pending interactions. Frames and control input are capped at 1 MiB. The host preserves question meaning instead of truncating actionable details and delegates questions whose serialized presentation exceeds 900000 bytes. Each request has at most 16 questions and each question at most 64 unique options. Custom answer text is capped at 4096 characters. Focus-only requests retain their 8 KiB cap. The app's observer may arrive after session metadata on another socket, so native code buffers a bounded unknown-session frame until matching lifecycle registration, otherwise explicitly delegates it.
+
+### Published result semantics
+
+`ask_user_question` returns `{answers: [{id, selected, custom?}]}`. The plan tool uses the same question service. Approval requires exactly `selected: [intent.approve]` with no `custom`. It returns `{approved:true}`, then commits `plan/mode` inactive at the next accepted pre-step. Keep-planning feedback produces a tool error with the user's feedback, not an approval. Dismissal in native DSH produces `ASK_CANCELLED`, which the plan tool converts to `{approved:false}` and concludes the turn. Tool results are authoritative observations, not a second opportunity to decide. Approval audit order is `approval/asked`, answerer waterfall, then matching `approval/decided` with one of `allowed-once`, `rejected`, `cancelled`, or `unavailable`.
+
+### Observed outcome wire
+
+Terminal `PostToolUse` and the same turn's `Stop` include a bounded typed observation when the published APIs prove an outcome:
+
+```json
+{"interaction_result":{"kind":"plan","outcome":"approved","call_id":"native-call-id"},"turn_id":3}
+```
+
+Kinds are `plan` and `question`. Outcomes are `approved`, `declined`, `answered`, `cancelled`, and `failed`. The public question waterfall's result is observed even when native DSH owns the UI. A plan's exact approve selection is remembered but is not published as success until its terminal tool result arrives. Any terminal error overrides a remembered approval. A keep-planning selection is `declined` even though the published tool intentionally throws to return feedback. Native `ASK_CANCELLED` is `cancelled`, including when the plan tool converts it to a successful `{approved:false}` return. Cancellation error codes and structured result schemas are read directly. Arbitrary result prose, error text, raw answers, and generic tool output are never forwarded or searched for verdict words.
+
+A question or plan terminal result clears earlier same-turn assistant preamble. Only visible assistant text arriving afterward supplies the final markdown. If no final text arrives, the app can present the typed result instead of stale pre-tool text. Starting another turn clears both the retained result and assistant text.
+
+Unknown call identity cannot safely reconstruct a result. This includes in-flight calls from before plugin attachment, and legacy overlapping question calls whose public request carries no call ID. An unstructured successful plan result without a correlated observed public answer cannot be classified by its rendered prose. Timed question `pending` results are not answers, and late steered replies are not terminal tool results, so no fabricated terminal status is emitted for those paths. These cases retain native DSH presentation.
 
 ## Tests
 

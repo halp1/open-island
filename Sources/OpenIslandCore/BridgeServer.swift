@@ -77,6 +77,20 @@ public final class BridgeServer: @unchecked Sendable {
     private var pendingClaudeInteractions: [String: PendingClaudeInteraction] = [:]
     private var pendingOpenCodeInteractions: [String: PendingOpenCodeInteraction] = [:]
     private var pendingCursorInteractions: [String: PendingCursorInteraction] = [:]
+    private struct PendingDSHInteraction {
+        var request: DSHInteraction
+        var subscription: DSHInteractionSubscription
+        var responding = false
+    }
+    private var dshSubscriptions: [String: DSHInteractionSubscription] = [:]
+    private var pendingDSHInteractions: [String: [UUID: PendingDSHInteraction]] = [:]
+    private var pendingDSHOrder: [String: [UUID]] = [:]
+    private struct BufferedDSHInteraction {
+        var sessionID: String
+        var request: DSHInteraction
+        var subscription: DSHInteractionSubscription
+    }
+    private var bufferedDSHInteractions: [UUID: BufferedDSHInteraction] = [:]
     /// Caches Agent tool description from preToolUse for use by the next subagentStart.
     private var pendingAgentDescriptions: [String: String] = [:]
     /// Maps toolUseID → temporary task ID for TaskCreate, so postToolUse can update with real ID.
@@ -183,8 +197,10 @@ public final class BridgeServer: @unchecked Sendable {
     /// can read session data without maintaining its own copy.
     public func updateStateSnapshot(_ snapshot: SessionState) {
         queue.async { [self] in
-            stateSnapshot = snapshot
-            localState = snapshot
+            var filtered = snapshot
+            filtered.retainDSHExclusions(from: localState)
+            stateSnapshot = filtered
+            localState = filtered
         }
     }
 
@@ -196,6 +212,11 @@ public final class BridgeServer: @unchecked Sendable {
         pendingTaskCreations.removeAll()
         pendingOpenCodeInteractions.removeAll()
         pendingCursorInteractions.removeAll()
+        dshSubscriptions.values.forEach { $0.cancel() }
+        dshSubscriptions.removeAll()
+        pendingDSHInteractions.removeAll()
+        pendingDSHOrder.removeAll()
+        bufferedDSHInteractions.removeAll()
 
         let activeConnections = Array(clients.values)
         activeConnections.forEach { $0.readSource.cancel() }
@@ -324,7 +345,7 @@ public final class BridgeServer: @unchecked Sendable {
             send(.response(.acknowledged), to: clientID)
 
         case let .requestQuestion(sessionID, prompt):
-            guard hasSession(id: sessionID) else {
+            guard hasSession(id: sessionID), localState.session(id: sessionID)?.tool != .dsh else {
                 send(.response(.acknowledged), to: clientID)
                 return
             }
@@ -341,6 +362,10 @@ public final class BridgeServer: @unchecked Sendable {
             send(.response(.acknowledged), to: clientID)
 
         case let .resolvePermission(sessionID, resolution):
+            guard localState.session(id: sessionID)?.tool != .dsh else {
+                send(.response(.acknowledged), to: clientID)
+                return
+            }
             if pendingClaudeInteractions[sessionID] != nil {
                 resolvePendingClaudeInteraction(sessionID: sessionID, resolution: resolution)
                 send(.response(.acknowledged), to: clientID)
@@ -440,6 +465,10 @@ public final class BridgeServer: @unchecked Sendable {
             send(.response(.acknowledged), to: clientID)
 
         case let .answerQuestion(sessionID, response):
+            guard localState.session(id: sessionID)?.tool != .dsh else {
+                send(.response(.acknowledged), to: clientID)
+                return
+            }
             if pendingClaudeInteractions[sessionID] != nil {
                 resolvePendingClaudeQuestion(sessionID: sessionID, response: response)
                 send(.response(.acknowledged), to: clientID)
@@ -487,7 +516,35 @@ public final class BridgeServer: @unchecked Sendable {
         case let .processPiHook(payload):
             handleRuntimeHook(payload, from: clientID)
         case let .processDSHHook(payload):
-            handleRuntimeHook(payload, from: clientID)
+            if payload.isSubagent == true {
+                clearDSHInteractions(sessionID: payload.sessionID, emitResolution: false)
+                // A classification tombstone removes legacy persisted rows without
+                // creating a completion card, sound, or notification.
+                emit(.piSessionMetadataUpdated(PiSessionMetadataUpdated(
+                    sessionID: payload.sessionID,
+                    piMetadata: PiSessionMetadata(isSubagent: true, parentSessionID: payload.parentSessionID),
+                    timestamp: localState.session(id: payload.sessionID)?.updatedAt ?? .now
+                )))
+                send(.response(.acknowledged), to: clientID)
+                return
+            }
+            guard payload.isSubagent == false, !localState.excludedDSHSessionIDs.contains(payload.sessionID) else {
+                send(.response(.acknowledged), to: clientID)
+                return
+            }
+            if payload.hookEventName == .stop, !shouldCompleteDSHTurn(payload) {
+                // Independent sockets can deliver a prior turn's Stop after a
+                // newer pending card. Its completion metadata is stale as well.
+                send(.response(.acknowledged), to: clientID)
+            } else {
+                handleRuntimeHook(payload, from: clientID)
+            }
+            if [.sessionEnd, .sessionStart].contains(payload.hookEventName) {
+                clearDSHInteractions(sessionID: payload.sessionID, includingBuffered: payload.hookEventName != .sessionStart)
+            }
+            if payload.hookEventName != .sessionEnd {
+                ensureDSHSubscription(for: payload)
+            }
         case let .processHermesHook(payload):
             handleHermesHook(payload, from: clientID)
         }
@@ -1204,6 +1261,273 @@ public final class BridgeServer: @unchecked Sendable {
         }
     }
 
+    /// Sends only an explicit answer for the exact card the user acted on.
+    public func answerDSHQuestion(
+        sessionID: String, requestID: UUID, response: QuestionPromptResponse
+    ) async throws {
+        try await respondToDSHInteraction(sessionID: sessionID, requestID: requestID) { request, observerID in
+            DSHInteractionCommand(
+                observerID: observerID, sessionID: sessionID, requestID: request.requestID,
+                answers: try request.nativeAnswers(for: response)
+            )
+        }
+    }
+
+    public func resolveDSHPermission(
+        sessionID: String, requestID: UUID, resolution: PermissionResolution
+    ) async throws {
+        try await respondToDSHInteraction(sessionID: sessionID, requestID: requestID) { request, observerID in
+            guard request.kind == .approval else { throw DSHInteractionError.invalidResponse }
+            let decision: String
+            switch resolution {
+            case let .allowOnce(updatedInput, updatedPermissions):
+                guard updatedInput == nil, updatedPermissions.isEmpty else { throw DSHInteractionError.invalidResponse }
+                decision = "allowed-once"
+            case .deny:
+                decision = "rejected"
+            }
+            return DSHInteractionCommand(
+                observerID: observerID, sessionID: sessionID, requestID: request.requestID, decision: decision
+            )
+        }
+    }
+
+    private func respondToDSHInteraction(
+        sessionID: String, requestID: UUID,
+        makeCommand: @escaping @Sendable (DSHInteraction, String) throws -> DSHInteractionCommand
+    ) async throws {
+        try Task.checkCancellation()
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+            queue.async { [self] in
+                guard var pending = pendingDSHInteractions[sessionID]?[requestID], !pending.responding,
+                      pendingDSHOrder[sessionID]?.first == requestID,
+                      localState.session(id: sessionID)?.isSessionEnded == false,
+                      localState.session(id: sessionID)?.jumpTarget?.dshWeb?.focusSocketPath == pending.subscription.socketPath,
+                      dshSubscriptions[pending.subscription.socketPath] === pending.subscription else {
+                    continuation.resume(throwing: DSHInteractionError.staleRequest)
+                    return
+                }
+                let command: DSHInteractionCommand
+                do { command = try makeCommand(pending.request, pending.subscription.observerID) }
+                catch { continuation.resume(throwing: error)
+                    return
+                }
+                pending.responding = true
+                pendingDSHInteractions[sessionID]?[requestID] = pending
+                let subscription = pending.subscription
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    let result = Result { try subscription.respond(command) }
+                    self?.queue.async { [weak self] in
+                        guard let self else { return }
+                        if case .failure = result,
+                           var current = self.pendingDSHInteractions[sessionID]?[requestID],
+                           current.subscription === subscription {
+                            current.responding = false
+                            self.pendingDSHInteractions[sessionID]?[requestID] = current
+                        }
+                    }
+                    continuation.resume(with: result)
+                }
+            }
+        }
+    }
+
+    private func ensureDSHSubscription(for payload: DSHHookPayload) {
+        guard let session = localState.session(id: payload.sessionID), session.tool == .dsh,
+              !session.isSessionEnded, let path = session.jumpTarget?.dshWeb?.focusSocketPath,
+              (try? DSHFocusClient.validateEndpoint(path)) != nil else { return }
+        if pendingDSHInteractions[payload.sessionID]?.values.contains(where: { $0.subscription.socketPath != path }) == true {
+            clearDSHInteractions(sessionID: payload.sessionID)
+        }
+        if dshSubscriptions[path] == nil {
+            let observerID = UUID().uuidString.lowercased()
+            let subscription = DSHInteractionSubscription(
+                socketPath: path, observerID: observerID,
+                onInteraction: { [weak self] sessionID, interaction in
+                    self?.queue.async { [weak self] in
+                        guard let self, let subscription = self.dshSubscriptions[path],
+                              subscription.observerID == observerID else { return }
+                        self.handleDSHInteraction(sessionID: sessionID, request: interaction, subscription: subscription)
+                    }
+                },
+                onDisconnect: { [weak self] in
+                    self?.queue.async { [weak self] in
+                        self?.disconnectDSHSubscription(path: path, observerID: observerID)
+                    }
+                }
+            )
+            dshSubscriptions[path] = subscription
+            subscription.start()
+        }
+        guard let subscription = dshSubscriptions[path] else { return }
+        if let interaction = payload.interaction {
+            handleDSHInteraction(sessionID: payload.sessionID, request: interaction, subscription: subscription)
+        }
+        let buffered = bufferedDSHInteractions.values.filter {
+            $0.sessionID == payload.sessionID && $0.subscription === subscription
+        }
+        for item in buffered {
+            if let id = item.request.presentationID { bufferedDSHInteractions.removeValue(forKey: id) }
+            handleDSHInteraction(sessionID: item.sessionID, request: item.request, subscription: subscription)
+        }
+    }
+
+    private func handleDSHInteraction(
+        sessionID: String, request: DSHInteraction, subscription: DSHInteractionSubscription
+    ) {
+        guard let id = request.presentationID,
+              dshSubscriptions[subscription.socketPath] === subscription else { return }
+        if request.status == .resolved {
+            if bufferedDSHInteractions[id]?.subscription === subscription,
+               bufferedDSHInteractions[id]?.sessionID == sessionID {
+                bufferedDSHInteractions.removeValue(forKey: id)
+            }
+            guard pendingDSHInteractions[sessionID]?[id]?.subscription === subscription else { return }
+            let visible = pendingDSHOrder[sessionID]?.first == id
+            pendingDSHInteractions[sessionID]?.removeValue(forKey: id)
+            pendingDSHOrder[sessionID]?.removeAll { $0 == id }
+            if visible {
+                emitDSHResolution(sessionID: sessionID)
+                presentNextDSHInteraction(sessionID: sessionID)
+            }
+            return
+        }
+        if localState.excludedDSHSessionIDs.contains(sessionID) || localState.session(id: sessionID)?.piMetadata?.isSubagent == true {
+            delegateDSHInteraction(sessionID: sessionID, request: request, subscription: subscription)
+            return
+        }
+        guard request.questionPrompt != nil || request.permissionRequest != nil else {
+            delegateDSHInteraction(sessionID: sessionID, request: request, subscription: subscription)
+            return
+        }
+        guard let session = localState.session(id: sessionID), session.tool == .dsh, session.piMetadata?.isSubagent == false,
+              !session.isSessionEnded,
+              session.jumpTarget?.dshWeb?.focusSocketPath == subscription.socketPath else {
+            guard bufferedDSHInteractions[id] == nil else { return }
+            guard bufferedDSHInteractions.count < 128 else {
+                delegateDSHInteraction(sessionID: sessionID, request: request, subscription: subscription)
+                return
+            }
+            bufferedDSHInteractions[id] = BufferedDSHInteraction(
+                sessionID: sessionID, request: request, subscription: subscription
+            )
+            queue.asyncAfter(deadline: .now() + 2) { [weak self] in
+                guard let self, let buffered = self.bufferedDSHInteractions[id],
+                      buffered.subscription === subscription else { return }
+                self.bufferedDSHInteractions.removeValue(forKey: id)
+                self.delegateDSHInteraction(sessionID: sessionID, request: request, subscription: subscription)
+            }
+            return
+        }
+        guard pendingDSHInteractions[sessionID]?[id] == nil else { return }
+        guard pendingDSHInteractions.values.reduce(0, { $0 + $1.count }) < 128 else {
+            delegateDSHInteraction(sessionID: sessionID, request: request, subscription: subscription)
+            return
+        }
+        pendingDSHInteractions[sessionID, default: [:]][id] = PendingDSHInteraction(
+            request: request, subscription: subscription
+        )
+        pendingDSHOrder[sessionID, default: []].append(id)
+        if pendingDSHOrder[sessionID]?.first == id { presentNextDSHInteraction(sessionID: sessionID) }
+    }
+
+    private func presentNextDSHInteraction(sessionID: String) {
+        guard let id = pendingDSHOrder[sessionID]?.first,
+              let pending = pendingDSHInteractions[sessionID]?[id] else { return }
+        if let prompt = pending.request.questionPrompt {
+            emit(.questionAsked(QuestionAsked(sessionID: sessionID, prompt: prompt, timestamp: .now)))
+        } else if let request = pending.request.permissionRequest {
+            emit(.permissionRequested(PermissionRequested(sessionID: sessionID, request: request, timestamp: .now)))
+        }
+    }
+
+    private func emitDSHResolution(sessionID: String) {
+        guard let session = localState.session(id: sessionID),
+              session.phase == .waitingForAnswer || session.phase == .waitingForApproval else { return }
+        emit(.actionableStateResolved(ActionableStateResolved(
+            sessionID: sessionID, summary: "DSH request resolved.", timestamp: .now
+        )))
+    }
+
+    private func clearDSHInteractions(sessionID: String, includingBuffered: Bool = true, emitResolution: Bool = true) {
+        if let pending = pendingDSHInteractions.removeValue(forKey: sessionID) {
+            pendingDSHOrder.removeValue(forKey: sessionID)
+            for item in pending.values {
+                delegateDSHInteraction(sessionID: sessionID, request: item.request, subscription: item.subscription)
+            }
+            if emitResolution { emitDSHResolution(sessionID: sessionID) }
+        }
+        guard includingBuffered else { return }
+        let buffered = bufferedDSHInteractions.filter { $0.value.sessionID == sessionID }
+        for (id, item) in buffered {
+            bufferedDSHInteractions.removeValue(forKey: id)
+            delegateDSHInteraction(sessionID: sessionID, request: item.request, subscription: item.subscription)
+        }
+    }
+
+    private func disconnectDSHSubscription(path: String, observerID: String) {
+        guard let subscription = dshSubscriptions[path], subscription.observerID == observerID else { return }
+        dshSubscriptions.removeValue(forKey: path)
+        subscription.cancel()
+        bufferedDSHInteractions = bufferedDSHInteractions.filter { $0.value.subscription !== subscription }
+        for sessionID in Array(pendingDSHInteractions.keys) {
+            let visible = pendingDSHOrder[sessionID]?.first
+            let removedVisible = visible.flatMap { pendingDSHInteractions[sessionID]?[$0]?.subscription } === subscription
+            let removed = Set((pendingDSHInteractions[sessionID] ?? [:]).filter {
+                $0.value.subscription === subscription
+            }.keys)
+            for id in removed { pendingDSHInteractions[sessionID]?.removeValue(forKey: id) }
+            pendingDSHOrder[sessionID]?.removeAll { removed.contains($0) }
+            if removedVisible {
+                emitDSHResolution(sessionID: sessionID)
+                presentNextDSHInteraction(sessionID: sessionID)
+            }
+        }
+    }
+
+    private func delegateDSHInteraction(
+        sessionID: String, request: DSHInteraction, subscription: DSHInteractionSubscription
+    ) {
+        let command = DSHInteractionCommand(
+            observerID: subscription.observerID, sessionID: sessionID,
+            requestID: request.requestID, decision: "delegate"
+        )
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            do { try subscription.respond(command) }
+            catch {
+                // Without an acknowledged delegate, only ending this exact lease
+                // guarantees the discarded request returns to native DSH.
+                subscription.cancel()
+                self?.queue.async { [weak self] in
+                    self?.disconnectDSHSubscription(path: subscription.socketPath, observerID: subscription.observerID)
+                }
+            }
+        }
+    }
+
+    private func shouldCompleteDSHTurn(_ payload: DSHHookPayload) -> Bool {
+        let sessionID = payload.sessionID
+        guard let order = pendingDSHOrder[sessionID], !order.isEmpty else { return true }
+        guard let turn = payload.turnID, turn >= 0 else { return false }
+        let removed = Set(order.filter { id in
+            guard let requestTurn = pendingDSHInteractions[sessionID]?[id]?.request.turnID else { return false }
+            return requestTurn >= 0 && requestTurn <= turn
+        })
+        let removedVisible = order.first.map { removed.contains($0) } ?? false
+        for id in removed { pendingDSHInteractions[sessionID]?.removeValue(forKey: id) }
+        pendingDSHOrder[sessionID]?.removeAll { removed.contains($0) }
+        if pendingDSHOrder[sessionID]?.isEmpty == true {
+            pendingDSHOrder.removeValue(forKey: sessionID)
+            pendingDSHInteractions.removeValue(forKey: sessionID)
+            return true
+        }
+        if removedVisible {
+            emitDSHResolution(sessionID: sessionID)
+            presentNextDSHInteraction(sessionID: sessionID)
+        }
+        return false
+    }
+
     private func handleRuntimeHook(_ payload: some RuntimeHookPayload, from clientID: UUID) {
         guard !payload.sessionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             send(.response(.acknowledged), to: clientID)
@@ -1286,7 +1610,8 @@ public final class BridgeServer: @unchecked Sendable {
                 .activityUpdated(
                     SessionActivityUpdated(
                         sessionID: payload.sessionID,
-                        summary: payload.toolName.map { "\($0) finished." } ?? "\(displayName) tool finished.",
+                        summary: payload.postToolUseSummary
+                            ?? payload.toolName.map { "\($0) finished." } ?? "\(displayName) tool finished.",
                         phase: .running,
                         timestamp: .now
                     )
@@ -1302,9 +1627,10 @@ public final class BridgeServer: @unchecked Sendable {
                 .sessionCompleted(
                     SessionCompleted(
                         sessionID: payload.sessionID,
-                        summary: payload.assistantMessagePreview
+                        summary: payload.completionSummary ?? payload.assistantMessagePreview
                             ?? "\(displayName) completed the turn.",
-                        timestamp: .now
+                        timestamp: .now,
+                        isInterrupt: payload.isInterrupt
                     )
                 )
             )

@@ -1,6 +1,6 @@
-// Lifecycle observer and narrow conversation focus relay. No tool or approval controls.
+// Lifecycle observer, private focus relay, and leased explicit human interactions.
 import { connect, createServer } from 'node:net'
-import { randomBytes } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 import { chmod, lstat, mkdir, rmdir } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -11,15 +11,61 @@ export const inject = ['sessions']
 const DEFAULT_HEARTBEAT_MS = 15_000
 const MAX_PREVIEW = 4096
 
-function preview(value) {
-  return typeof value === 'string' && value.trim() ? value.slice(0, MAX_PREVIEW) : undefined
+function preview(value, limit = MAX_PREVIEW) {
+  return typeof value === 'string' && value.trim() ? value.slice(0, limit) : undefined
 }
 
-function textContent(content) {
-  if (typeof content === 'string') return preview(content)
+function textContent(content, limit = MAX_PREVIEW) {
+  if (typeof content === 'string') return preview(content, limit)
   if (!Array.isArray(content)) return undefined
   return preview(content.filter(part => part?.type === 'text' && typeof part.text === 'string')
-    .map(part => part.text).join('\n'))
+    .map(part => part.text).join('\n'), limit)
+}
+
+function assistantText(content) {
+  const text = textContent(content, Infinity)
+  if (!text) return undefined
+  const bytes = Buffer.from(text)
+  // Streaming decode excludes a UTF-8 code point cut by the byte boundary.
+  return new TextDecoder().decode(bytes.subarray(0, 16384), { stream: true })
+}
+
+const validTurn = value => Number.isSafeInteger(value) && value >= 0
+const cancellationCodes = new Set(['ASK_CANCELLED', 'ASK_ABORTED', 'ABORTED', 'ABORTED_BEFORE_DISPATCH'])
+
+function answerBatch(value) {
+  if (!value || !Array.isArray(value.answers) || value.answers.some(answer => !answer
+    || typeof answer.id !== 'string' || !Array.isArray(answer.selected)
+    || answer.selected.some(label => typeof label !== 'string')
+    || (answer.custom !== undefined && typeof answer.custom !== 'string'))
+    || new Set(value.answers.map(answer => answer.id)).size !== value.answers.length) return undefined
+  return value.answers
+}
+
+function resultValue(message) {
+  const blocks = message?.content
+  if (!Array.isArray(blocks) || blocks.length !== 1 || blocks[0]?.type !== 'text'
+    || typeof blocks[0].text !== 'string') return undefined
+  try { return JSON.parse(blocks[0].text) } catch { return undefined }
+}
+
+function interactionResult(state, callId, toolName, data) {
+  const observed = state.interactionCalls?.get(callId)
+  state.interactionCalls?.delete(callId)
+  const kind = toolName === 'exit_plan_mode' ? 'plan' : toolName === 'ask_user_question' ? 'question' : undefined
+  if (!kind) return undefined
+  const failed = data.error !== undefined || data.message?.isError === true
+  let outcome
+  if (cancellationCodes.has(data.error?.code)) outcome = 'cancelled'
+  else if (failed) outcome = kind === 'plan' && observed?.outcome === 'declined' ? 'declined' : 'failed'
+  else {
+    const value = resultValue(data.message)
+    // Read only the two published tools' structured schemas, never result prose.
+    if (kind === 'plan' && typeof value?.approved === 'boolean') outcome = value.approved ? 'approved' : 'cancelled'
+    else if (kind === 'question' && answerBatch(value)) outcome = 'answered'
+    else outcome = observed?.outcome
+  }
+  return outcome ? { kind, outcome, call_id: callId } : undefined
 }
 
 function validInterval(value) {
@@ -38,9 +84,13 @@ function modelName(config) {
 export function normalizeEvent(state, event) {
   const data = event?.data
   if (!data || typeof data !== 'object') return undefined
+  if (['turn/start', 'turn/end', 'tool/call', 'tool/result', 'assistant/message'].includes(event.type)
+    && validTurn(data.turn)) state.turnId = data.turn
   switch (event.type) {
     case 'turn/start':
       state.lastAssistantMessage = undefined
+      state.interactionResult = undefined
+      state.interactionCalls?.clear()
       return undefined
     case 'request/header':
       state.model = modelName(data.header?.config) || state.model
@@ -64,15 +114,26 @@ export function normalizeEvent(state, event) {
       if (typeof callId !== 'string') return undefined
       const toolName = state.tools.get(callId)
       state.tools.delete(callId)
-      return { hook_event_name: 'PostToolUse', tool_name: preview(toolName) }
+      const result = interactionResult(state, callId, toolName, data)
+      if (toolName === 'exit_plan_mode' || toolName === 'ask_user_question') {
+        // A pre-tool preamble is not the final response to the human's decision.
+        state.lastAssistantMessage = undefined
+      }
+      if (result) state.interactionResult = result
+      return { hook_event_name: 'PostToolUse', tool_name: preview(toolName),
+        ...(result ? { interaction_result: result } : {}) }
     }
     case 'assistant/message':
-      state.lastAssistantMessage = textContent(data.message?.content) || state.lastAssistantMessage
+      state.lastAssistantMessage = assistantText(data.message?.content) || state.lastAssistantMessage
       state.model = modelName(data.message?.source) || state.model
       return undefined
     case 'turn/end':
       state.tools.clear()
-      return { hook_event_name: 'Stop', last_assistant_message: state.lastAssistantMessage }
+      state.interactionCalls?.clear()
+      return { hook_event_name: 'Stop', last_assistant_message: state.lastAssistantMessage,
+        ...(typeof data.reason?.kind === 'string' && data.reason.kind.length <= 128
+          ? { turn_outcome: data.reason.kind } : {}),
+        ...(state.interactionResult ? { interaction_result: state.interactionResult } : {}) }
     default:
       return undefined
   }
@@ -164,9 +225,8 @@ const failure = error => ({ ok: false, error })
 const validId = value => typeof value === 'string' && value.length > 0
   && value.length <= 512 && !/[\u0000-\u001f\u007f]/.test(value)
 
-// The only local command is selection + composer focus. Each host owns one random
-// endpoint, and each request replaces older work rather than replaying stale clicks.
-export async function createFocusRelay({ hasSession, timeoutMs = 5800, pollMs = 1000 } = {}) {
+// One private endpoint carries focus commands and an optional interaction observer.
+export async function createFocusRelay({ hasSession, interactions, timeoutMs = 5800, pollMs = 1000 } = {}) {
   const directory = `/tmp/oi-dsh-focus-${randomBytes(12).toString('hex')}`
   await mkdir(directory, { mode: 0o700 })
   const ownedDirectory = await lstat(directory)
@@ -308,7 +368,7 @@ export async function createFocusRelay({ hasSession, timeoutMs = 5800, pollMs = 
     socket.on('data', chunk => {
       if (accepted) return
       bytes += Buffer.byteLength(chunk)
-      if (bytes > 8192) {
+      if (bytes > 1048576 || (bytes > 8192 && !/^\s*\{/.test(buffer + chunk))) {
         accepted = true
         return reply(failure('invalid-request'))
       }
@@ -317,7 +377,12 @@ export async function createFocusRelay({ hasSession, timeoutMs = 5800, pollMs = 
       accepted = true
       let body
       try { body = JSON.parse(buffer.trim()) } catch { return reply(failure('invalid-request')) }
-      if (!body || !validId(body.session_id) || Object.keys(body).length !== 1) return reply(failure('invalid-request'))
+      if (body?.type === 'observe_interactions' && interactions) {
+        clearTimeout(timer)
+        return interactions.attach(socket, body)
+      }
+      if (body?.type === 'respond_interaction' && interactions) return reply(interactions.respond(body))
+      if (bytes > 8192 || !body || !validId(body.session_id) || Object.keys(body).length !== 1) return reply(failure('invalid-request'))
       void request(body.session_id, Math.max(1, deadline - Date.now() - 20)).then(reply)
     })
   })
@@ -355,6 +420,200 @@ export async function createFocusRelay({ hasSession, timeoutMs = 5800, pollMs = 
   }
 }
 
+// Own exactly one answerer at a time. Losing the native observer first revokes
+// all request IDs, then delegates to the original DSH waterfall. Never race next().
+export function createInteractionController({ isLive, callIdFor, turnIdFor, pingMs = 1000, leaseMs = 4000 } = {}) {
+  const pending = new Map()
+  let observer
+  let disposed = false
+  const aborted = () => Object.assign(new Error('Question lifetime ended'), { name: 'UserQuestionError', code: 'ASK_ABORTED' })
+  const validUUID = value => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
+  const keysOnly = (value, keys) => value && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).every(key => keys.includes(key))
+  const write = (socket, frame) => {
+    if (socket.destroyed || socket.writableEnded || socket.writableLength > 1048576) return false
+    try {
+      socket.write(JSON.stringify(frame) + '\n')
+      return true
+    } catch { return false }
+  }
+  function publish(entry, status, resolution) {
+    if (!observer) return false
+    const presentation = status === 'pending' ? entry.presentation
+      : { request_id: entry.presentation.request_id, kind: entry.presentation.kind,
+        call_id: entry.presentation.call_id, turn_id: entry.presentation.turn_id }
+    return write(observer.socket, { type: 'interaction', session_id: entry.session.id,
+      interaction: { ...presentation, status, ...(resolution ? { resolution } : {}) } })
+  }
+  function finish(entry, action, value) {
+    if (pending.get(entry.presentation.request_id) !== entry) return
+    pending.delete(entry.presentation.request_id)
+    entry.signal?.removeEventListener('abort', entry.abort)
+    if (!publish(entry, 'resolved', action) && observer) detach(observer)
+    // Promise scheduling prevents a downstream handler from running before every
+    // stale ID has been revoked during observer shutdown.
+    if (action === 'delegate') Promise.resolve().then(entry.next).then(entry.resolve, entry.reject)
+    else if (action === 'cancelled') {
+      if (entry.presentation.kind === 'approval') entry.resolve('cancelled')
+      else entry.reject(aborted())
+    } else entry.resolve(value)
+  }
+  function detach(client) {
+    if (observer !== client) return
+    observer = undefined
+    clearInterval(client.timer)
+    for (const entry of [...pending.values()]) finish(entry, 'delegate')
+    client.socket.destroy()
+  }
+  function attach(socket, body) {
+    if (disposed || !keysOnly(body, ['type', 'protocol_version', 'observer_id']) || body.protocol_version !== 1 || !validUUID(body.observer_id)) {
+      return socket.end(JSON.stringify(failure('invalid-request')) + '\n')
+    }
+    if (observer) return socket.end(JSON.stringify(failure('busy')) + '\n')
+    const client = { socket, id: body.observer_id, seen: Date.now(), nonce: undefined }
+    observer = client
+    let buffer = ''
+    socket.on('data', chunk => {
+      buffer += chunk.toString('utf8')
+      if (Buffer.byteLength(buffer) > 8192) return detach(client)
+      while (buffer.includes('\n')) {
+        const index = buffer.indexOf('\n')
+        const line = buffer.slice(0, index)
+        buffer = buffer.slice(index + 1)
+        let frame
+        try { frame = JSON.parse(line) } catch { return detach(client) }
+        if (!keysOnly(frame, ['type', 'nonce', 'observer_id']) || frame.type !== 'interaction_pong'
+          || frame.observer_id !== client.id || !client.nonce || frame.nonce !== client.nonce) return detach(client)
+        client.seen = Date.now()
+        client.nonce = undefined
+      }
+    })
+    socket.once('close', () => detach(client))
+    socket.once('end', () => detach(client))
+    socket.once('error', () => detach(client))
+    client.timer = setInterval(() => {
+      if (Date.now() - client.seen >= leaseMs) return detach(client)
+      // Keep only one challenge outstanding. Repeating it while a busy app is
+      // catching up would produce duplicate pongs and revoke a healthy observer.
+      if (client.nonce) return
+      client.nonce = randomUUID()
+      if (!write(socket, { type: 'interaction_ping', observer_id: client.id, nonce: client.nonce })) detach(client)
+    }, pingMs)
+    client.timer.unref()
+    if (!write(socket, { type: 'interaction_ready', protocol_version: 1, observer_id: client.id })) detach(client)
+  }
+  function questionsOf(request) {
+    const questions = request.questions
+    if (!Array.isArray(questions) || questions.length < 1 || questions.length > 16) return undefined
+    const ids = new Set()
+    for (const question of questions) {
+      if (!validId(question?.id) || ids.has(question.id) || typeof question.question !== 'string'
+        || (question.detail !== undefined && typeof question.detail !== 'string')
+        || (question.header !== undefined && typeof question.header !== 'string')
+        || (question.multiSelect !== undefined && typeof question.multiSelect !== 'boolean')) return undefined
+      ids.add(question.id)
+      if (question.options !== undefined && (!Array.isArray(question.options) || question.options.length > 64
+        || question.options.some(option => !validId(option?.label)
+          || (option.description !== undefined && typeof option.description !== 'string'))
+        || new Set(question.options.map(option => option.label)).size !== question.options.length)) return undefined
+      if (question.intent !== undefined && (question.intent.kind !== 'plan-review'
+        || !question.options?.some(option => option.label === question.intent.approve))) return undefined
+    }
+    // Do not truncate a decision's meaning. Oversized requests retain native UI.
+    if (Buffer.byteLength(JSON.stringify(questions)) > 900000) return undefined
+    return questions.map(question => ({ id: question.id, question: question.question,
+      ...(question.detail === undefined ? {} : { detail: question.detail }),
+      ...(question.header === undefined ? {} : { header: question.header }),
+      ...(question.options === undefined ? {} : { options: question.options.map(option => ({
+        label: option.label, ...(option.description === undefined ? {} : { description: option.description }),
+      })) }),
+      ...(question.multiSelect === undefined ? {} : { multiSelect: question.multiSelect }),
+      ...(question.intent === undefined ? {} : { intent: { ...question.intent } }),
+    }))
+  }
+  function request(kind, req, next) {
+    const session = req.agent?.session
+    // Timed waits need a separate public attachWait claim. This slice deliberately
+    // leaves their existing countdown and late-answer UI in native DSH.
+    if (disposed || !observer || pending.size >= 128 || !session || !isLive(req.agent) || req.wait?.timed === true) return next()
+    if (req.signal?.aborted) return kind === 'approval' ? Promise.resolve('cancelled') : Promise.reject(aborted())
+    let presentation
+    if (kind === 'approval') {
+      if (!validId(req.toolName) || (req.reason !== undefined && typeof req.reason !== 'string')) return next()
+      presentation = { kind, tool_name: req.toolName, ...(req.reason === undefined ? {} : { reason: req.reason }),
+        ...(req.callId === undefined ? {} : { call_id: req.callId }) }
+    } else {
+      let questions
+      try { questions = questionsOf(req) } catch { return next() }
+      if (!questions) return next()
+      const plan = questions.length === 1 && questions[0].intent?.kind === 'plan-review'
+      const callId = req.wait?.callId ?? questions[0].intent?.callId ?? callIdFor?.(session)
+      presentation = { kind: plan ? 'plan' : 'question', questions, ...(callId ? { call_id: callId } : {}) }
+    }
+    presentation.request_id = randomUUID()
+    const turnId = turnIdFor?.(session)
+    if (validTurn(turnId)) presentation.turn_id = turnId
+    return new Promise((resolve, reject) => {
+      const entry = { session, agent: req.agent, presentation, next, resolve, reject, signal: req.signal }
+      entry.abort = () => finish(entry, 'cancelled')
+      pending.set(presentation.request_id, entry)
+      req.signal?.addEventListener('abort', entry.abort, { once: true })
+      if (req.signal?.aborted) return entry.abort()
+      if (!publish(entry, 'pending')) detach(observer)
+    })
+  }
+  function respond(body) {
+    if (!keysOnly(body, ['type', 'observer_id', 'session_id', 'request_id', 'decision', 'answers'])
+      || !validId(body.session_id) || !validUUID(body.request_id)) return failure('invalid-request')
+    if (!observer || body.observer_id !== observer.id) return failure('stale-request')
+    const entry = pending.get(body.request_id)
+    if (!entry || entry.session.id !== body.session_id || !isLiveSession(entry)) return failure('stale-request')
+    if (body.decision === 'delegate' && body.answers === undefined) {
+      finish(entry, 'delegate')
+      return { ok: true }
+    }
+    if (entry.presentation.kind === 'approval') {
+      if (body.answers !== undefined || !['allowed-once', 'rejected'].includes(body.decision)) return failure('invalid-request')
+      finish(entry, 'answered', body.decision)
+      return { ok: true }
+    }
+    const questions = entry.presentation.questions
+    if (body.decision !== undefined || !Array.isArray(body.answers) || body.answers.length !== questions.length) return failure('invalid-request')
+    const ids = new Set()
+    for (const answer of body.answers) {
+      const question = questions.find(item => item.id === answer?.id)
+      if (!keysOnly(answer, ['id', 'selected', 'custom']) || !question || ids.has(answer.id)
+        || !Array.isArray(answer.selected) || new Set(answer.selected).size !== answer.selected.length
+        || answer.selected.some(label => !question.options?.some(option => option.label === label))
+        || (!question.multiSelect && answer.selected.length > 1)
+        || (answer.custom !== undefined && (typeof answer.custom !== 'string' || answer.custom.length > 4096))) return failure('invalid-request')
+      ids.add(answer.id)
+    }
+    finish(entry, 'answered', { answers: body.answers.map(answer => ({ id: answer.id,
+      selected: [...answer.selected], ...(answer.custom === undefined ? {} : { custom: answer.custom }),
+    })) })
+    return { ok: true }
+  }
+  function isLiveSession(entry) {
+    return !disposed && !entry.signal?.aborted && isLive(entry.agent)
+  }
+  return {
+    attach, respond,
+    request,
+    cancelSession(session) {
+      for (const entry of [...pending.values()]) if (entry.session === session) finish(entry, 'cancelled')
+    },
+    cancelCall(session, callId) {
+      if (!validId(callId)) return
+      for (const entry of [...pending.values()]) if (entry.session === session && entry.presentation.call_id === callId) finish(entry, 'cancelled')
+    },
+    close() {
+      disposed = true
+      if (observer) detach(observer)
+    },
+  }
+}
+
 export function apply(ctx, config = {}) {
   const store = ctx.sessions
   const socketPath = config.socketPath || process.env.OPEN_ISLAND_SOCKET_PATH
@@ -363,18 +622,76 @@ export function apply(ctx, config = {}) {
   const heartbeatMs = validInterval(config.heartbeatIntervalMs ?? process.env.OPEN_ISLAND_HEARTBEAT_INTERVAL_MS)
   const transport = createSocketTransport(socketPath)
   const sessions = new Map()
+  const excluded = new WeakSet()
   let disposed = false
   let webMetadata = {}
+  function classification(session) {
+    if (!session || store.get(session.id) !== session) return { kind: 'unknown' }
+    if (excluded.has(session) || session.header?.origin === 'subagent' || session.header?.delegationDepth > 0) return { kind: 'child' }
+    const registry = ctx.get('agents')
+    const agent = registry?.get(session.id)
+    if (!agent || agent.session !== session) return { kind: 'unknown' }
+    return { kind: registry.roots().includes(agent) ? 'root' : 'child', agent }
+  }
+  function isRootAgent(agent) {
+    const current = classification(agent?.session)
+    return !disposed && current.kind === 'root' && current.agent === agent
+  }
+  function callIdFor(session) {
+    const calls = [...(sessions.get(session)?.tools ?? [])].filter(([, tool]) => tool === 'ask_user_question')
+    return calls.length === 1 ? calls[0][0] : undefined
+  }
+  const interactions = createInteractionController({
+    isLive: agent => isRootAgent(agent) && sessions.has(agent.session),
+    callIdFor,
+    turnIdFor: session => sessions.get(session)?.turnId,
+  })
+  ctx.on('user-questions/request', async (request, next) => {
+    if (request.agent?.session) start(request.agent.session)
+    const state = sessions.get(request.agent?.session)
+    const question = request.questions?.length === 1 ? request.questions[0] : undefined
+    const plan = question?.intent?.kind === 'plan-review'
+    const callId = request.wait?.callId ?? question?.intent?.callId ?? callIdFor(request.agent?.session)
+    const expectedTool = plan ? 'exit_plan_mode' : 'ask_user_question'
+    const observation = state?.tools.get(callId) === expectedTool ? {} : undefined
+    if (observation) state.interactionCalls.set(callId, observation)
+    try {
+      // Observe the original answer regardless of which answerer owns the UI.
+      // Returning this exact value preserves native validation and error behavior.
+      const answer = await interactions.request('question', request, next)
+      if (observation) {
+        const answers = answerBatch(answer)
+        const matching = answers && Array.isArray(request.questions)
+          && answers.length === request.questions.length
+          && request.questions.every(item => answers.some(entry => entry.id === item.id))
+        if (!matching) observation.outcome = 'failed'
+        else if (plan) {
+          const review = answers[0]
+          observation.outcome = review.selected.length === 1
+            && review.selected[0] === question.intent.approve && review.custom === undefined ? 'approved' : 'declined'
+        } else observation.outcome = 'answered'
+      }
+      return answer
+    } catch (error) {
+      if (observation) observation.outcome = cancellationCodes.has(error?.code) ? 'cancelled' : 'failed'
+      throw error
+    }
+  }, { prepend: true })
+  ctx.on('approval/request', (request, next) => {
+    if (request.agent?.session) start(request.agent.session)
+    return interactions.request('approval', request, next)
+  }, { prepend: true })
 
-  // Web services are optional. The sessions-only CLI observer keeps working.
+  // Web services are optional. Root classification still requires public Agents.
   ctx.inject(['connection', 'webApp'], webCtx => {
     webCtx.effect(() => {
       let cancelled = false
       let relay
       let unregister
       const ready = createFocusRelay({
-        hasSession: id => !disposed && store.get(id) !== undefined
-          && sessions.has(store.get(id)),
+        interactions,
+        hasSession: id => !disposed && sessions.has(store.get(id))
+          && classification(store.get(id)).kind === 'root',
       }).then(async value => {
         relay = value
         if (cancelled) return
@@ -399,10 +716,17 @@ export function apply(ctx, config = {}) {
   })
 
   function send(session, state, lifecycle) {
+    if (lifecycle.hook_event_name !== 'SessionEnd' && classification(session).kind !== 'root') {
+      start(session)
+      return
+    }
     const payload = {
       session_id: session.id,
       cwd: session.header?.cwd || process.cwd(),
+      is_subagent: false,
+      ...(session.header?.parentSession ? { parent_session_id: session.header.parentSession } : {}),
       model: state.model,
+      ...(validTurn(state.turnId) ? { turn_id: state.turnId } : {}),
       ...webMetadata,
       ...lifecycle,
     }
@@ -413,29 +737,64 @@ export function apply(ctx, config = {}) {
     const state = sessions.get(session)
     if (!state) return
     clearInterval(state.timer)
+    interactions.cancelSession(session)
     sessions.delete(session)
     send(session, state, { hook_event_name: 'SessionEnd' })
   }
 
+  function exclude(session) {
+    const state = sessions.get(session)
+    if (state) {
+      clearInterval(state.timer)
+      interactions.cancelSession(session)
+      sessions.delete(session)
+    }
+    if (excluded.has(session)) return
+    excluded.add(session)
+    // A tombstone only removes rows from older companions. Native must consume
+    // this before ordinary lifecycle processing, without a completion notification.
+    void transport.send({ type: 'command', command: { type: 'processDshHook', dshHook: {
+      hook_event_name: 'SessionEnd', session_id: session.id,
+      cwd: session.header?.cwd || process.cwd(), is_subagent: true,
+      ...(session.header?.parentSession ? { parent_session_id: session.header.parentSession } : {}),
+    } } })
+  }
+
   function start(session) {
-    if (disposed || sessions.has(session) || store.get(session.id) !== session) return
-    const state = { tools: new Map(), model: modelName(session.requestHeader?.()?.config) }
+    if (disposed || !session || store.get(session.id) !== session) return
+    const current = classification(session)
+    if (current.kind === 'child') return exclude(session)
+    if (current.kind !== 'root') return end(session)
+    const existing = sessions.get(session)
+    if (existing?.agent === current.agent) return
+    if (existing) end(session)
+    const state = { agent: current.agent, tools: new Map(), interactionCalls: new Map(), model: modelName(session.requestHeader?.()?.config) }
     sessions.set(session, state)
     send(session, state, { hook_event_name: 'SessionStart' })
     state.timer = setInterval(() => {
       if (store.get(session.id) !== session) return end(session)
-      send(session, state, { hook_event_name: 'Heartbeat' })
+      start(session)
+      if (sessions.get(session) === state) send(session, state, { hook_event_name: 'Heartbeat' })
     }, heartbeatMs)
     state.timer.unref()
   }
 
   ctx.on('session/created', start)
   ctx.on('session/disposed', end)
+  ctx.on('agent/created', ({ agent }) => { start(agent.session) }, { global: true })
+  ctx.on('agent/disposed', ({ agent }) => {
+    if (sessions.get(agent.session)?.agent === agent) end(agent.session)
+  }, { global: true })
+  ctx.inject(['agents'], () => {
+    for (const session of store.list()) start(session)
+  })
   ctx.on('session/event', (session, event) => {
     if (disposed || store.get(session.id) !== session) return
     start(session)
     const state = sessions.get(session)
     if (!state) return
+    if (event.type === 'tool/result') interactions.cancelCall(session, event.data?.message?.toolCallId)
+    if (event.type === 'turn/end') interactions.cancelSession(session)
     const lifecycle = normalizeEvent(state, event)
     if (lifecycle) send(session, state, lifecycle)
   })
@@ -444,6 +803,7 @@ export function apply(ctx, config = {}) {
   ctx.effect(() => async () => {
     disposed = true
     for (const session of sessions.keys()) end(session)
+    interactions.close()
     let deadline
     await Promise.race([
       transport.flush(),
