@@ -1395,6 +1395,12 @@ final class ProcessMonitoringCoordinator {
     // MARK: - Display helpers
 
     func liveAttachmentKey(for session: AgentSession) -> String? {
+        // DSH hosts independent sessions in one web app, not terminal panes.
+        // Display titles can share the entire abbreviated "session-" prefix.
+        if session.tool == .dsh {
+            return "dsh:session:\(session.id)"
+        }
+
         guard let jumpTarget = session.jumpTarget else {
             return nil
         }

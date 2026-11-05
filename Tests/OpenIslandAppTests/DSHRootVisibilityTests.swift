@@ -5,6 +5,45 @@ import OpenIslandCore
 
 @MainActor
 struct DSHRootVisibilityTests {
+    @Test(arguments: [false, true])
+    func independentRootsInOneWorkspaceKeepSeparateRows(hasFocusRelay: Bool) {
+        let now = Date.now
+        let ids = [
+            "session-01f1ca26-4f96-41b3-b06d-82300cc04fee",
+            "session-1d19c9ee-286b-4c51-b931-6604c0def37a",
+        ]
+        let roots = ids.map { id in
+            let hook = DSHHookPayload(
+                hookEventName: .sessionStart, sessionID: id, cwd: "/tmp/dsh",
+                webOrigin: hasFocusRelay ? "http://127.0.0.1:3080/" : nil,
+                webFocusSocket: hasFocusRelay ? "/tmp/oi-dsh-focus-test/focus.sock" : nil
+            )
+            var session = AgentSession(
+                id: id, title: "DSH", tool: .dsh, origin: .live,
+                attachmentState: .attached, phase: .running, summary: "Working",
+                updatedAt: now, jumpTarget: hook.defaultJumpTarget,
+                piMetadata: hook.defaultPiMetadata
+            )
+            session.isHookManaged = true
+            session.isProcessAlive = true
+            session.lastHeartbeatAt = now
+            return session
+        }
+        let model = AppModel()
+        model.state = SessionState(sessions: roots)
+        #expect(Set(model.surfacedSessions.map(\.id)) == Set(ids))
+        #expect(model.recentSessions.isEmpty)
+        #expect(model.liveSessionCount == 2)
+        #expect(model.liveRunningCount == 2)
+
+        model.state.apply(.sessionCompleted(SessionCompleted(
+            sessionID: ids[0], summary: "Finished", timestamp: now.addingTimeInterval(1)
+        )))
+        #expect(Set(model.surfacedSessions.map(\.id)) == Set(ids))
+        #expect(model.liveRunningCount == 1)
+        #expect(model.state.session(id: ids[1])?.phase == .running)
+    }
+
     @Test
     func cachedUnknownAndChildSessionsCannotBecomeRowsCardsOrSelection() async throws {
         let now = Date.now
