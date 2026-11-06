@@ -111,8 +111,18 @@ struct DSHInteractionRuntimeTests {
     ctx.provide('webApp', { getAdvertisedUrl: () => 'http://127.0.0.1:3080/' })
     await ctx.plugin(UserQuestionService).inertia
     await ctx.plugin(ApprovalService, { policy: 'ask' }).inertia
-    ctx.on('user-questions/request', request => ({ answers: request.questions.map(question => ({ id: question.id, selected: [], custom: 'native-fixture-fallback' })) }))
-    ctx.on('approval/request', () => 'rejected')
+    let nativeCards = 0
+    let nativeDismissals = 0
+    const nativeWait = request => new Promise((_resolve, reject) => {
+      nativeCards += 1
+      request.signal.addEventListener('abort', () => {
+        nativeDismissals += 1
+        reject(Object.assign(new Error('Native card dismissed'), { code: 'ASK_ABORTED' }))
+      }, { once: true })
+    })
+    ctx.on('user-questions/request', request => request.signal ? nativeWait(request)
+      : { answers: request.questions.map(question => ({ id: question.id, selected: [], custom: 'native-fixture-fallback' })) })
+    ctx.on('approval/request', nativeWait)
     const host = ctx.plugin(plugin, { socketPath })
     await host.inertia
     try {
@@ -142,6 +152,8 @@ struct DSHInteractionRuntimeTests {
       assert.deepEqual(await planTool.execute({ plan }, { agent, callId: 'plan-call', signal: new AbortController().signal }), { approved: true })
       session.append('tool/result', { turn: 1, step: 2, message: { id: 'plan-result', role: 'tool', source: { kind: 'tool', callId: 'plan-call' }, toolCallId: 'plan-call', content: [{ type: 'text', text: 'Plan review completed' }], isError: false } }, { surfaceOp: 'append' })
       assert.equal(await ctx.approval.request({ agent, toolName: 'synthetic-test-only', callId: 'approval-call', reason: 'Synthetic request, no command executes' }), 'allowed-once')
+      assert.equal(nativeCards, 3)
+      assert.equal(nativeDismissals, 3)
       const finalText = '# Integration verified\n\n' + 'Structured answers returned through the native bridge without altering permission policy. '.repeat(4)
       session.append('assistant/message', { turn: 1, message: { id: 'final-message', role: 'assistant', content: [{ type: 'text', text: finalText }] } }, { surfaceOp: 'append' })
       session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })

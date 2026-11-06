@@ -161,6 +161,67 @@ test('lease loss, explicit delegation, cancellation, result and disposal revoke 
   assert.equal(nativeCalls, 3)
 })
 
+test('shared native wait survives companion loss without redispatch and still follows cancellation', async t => {
+  for (const ending of ['native-answer', 'disconnect', 'original-abort', 'call-end', 'session-end']) {
+    await t.test(ending, async t => {
+      const { agent, controller, relay } = await fixture(t)
+      const observer = await observe(relay.socketPath)
+      t.after(() => observer.socket.destroy())
+      const original = new AbortController()
+      let nativeCalls = 0
+      let nativeSignal
+      let answerNative
+      const waiting = controller.request('question', { agent, questions, signal: original.signal, wait: { callId: 'shared' } },
+        () => assert.fail('Native wait was dispatched twice'), request => new Promise((resolve, reject) => {
+          nativeCalls += 1
+          nativeSignal = request.signal
+          answerNative = resolve
+          request.signal.addEventListener('abort', () => reject(Object.assign(new Error('cancelled'), { code: 'ASK_ABORTED' })), { once: true })
+        }))
+      const settled = waiting.then(value => ({ value }), error => ({ error }))
+      await until(() => observer.frames.some(frame => frame.interaction?.status === 'pending'))
+      const body = { type: 'respond_interaction', observer_id: observer.observerID, session_id: agent.session.id,
+        request_id: observer.frames.find(frame => frame.interaction).interaction.request_id }
+      if (ending === 'disconnect') {
+        observer.socket.destroy()
+        await until(() => controller.respond({ ...body, decision: 'invalid' }).error === 'stale-request')
+      } else assert.deepEqual(controller.respond({ ...body, decision: 'delegate' }), { ok: true })
+      assert.equal(controller.respond({ ...body, ...answer }).error, 'stale-request')
+      assert.equal(nativeSignal.aborted, false)
+      if (ending === 'original-abort') original.abort()
+      else if (ending === 'call-end') controller.cancelCall(agent.session, 'shared')
+      else if (ending === 'session-end') controller.cancelSession(agent.session)
+      else answerNative(answer)
+      const result = await settled
+      if (['original-abort', 'call-end', 'session-end'].includes(ending)) assert.equal(result.error.code, 'ASK_ABORTED')
+      else assert.deepEqual(result.value, answer)
+      assert.equal(nativeCalls, 1)
+      assert.equal(nativeSignal.aborted, true)
+    })
+  }
+})
+
+test('an unavailable native answerer does not preempt the companion', async t => {
+  for (const [kind, failure] of [['question', 'missing'], ['question', 'error'], ['approval', 'missing'], ['approval', 'error']]) {
+    await t.test(`${kind}-${failure}`, async t => {
+      const { agent, controller, relay } = await fixture(t)
+      const observer = await observe(relay.socketPath)
+      t.after(() => observer.socket.destroy())
+      const waiting = controller.request(kind, { agent, questions, toolName: 'write' },
+        () => assert.fail('Duplicate native dispatch'), async () => {
+          if (failure === 'error') throw new Error('Native transport failed')
+          if (kind === 'approval') return 'unavailable'
+          throw Object.assign(new Error('No answerer'), { code: 'NO_PROVIDER' })
+        })
+      await until(() => observer.frames.some(frame => frame.interaction?.status === 'pending'))
+      const requestID = observer.frames.find(frame => frame.interaction).interaction.request_id
+      assert.deepEqual(controller.respond({ type: 'respond_interaction', observer_id: observer.observerID,
+        session_id: agent.session.id, request_id: requestID, ...(kind === 'approval' ? { decision: 'rejected' } : answer) }), { ok: true })
+      assert.deepEqual(await waiting, kind === 'approval' ? 'rejected' : answer)
+    })
+  }
+})
+
 async function installedRuntime() {
   try {
     const require = process.env.DSH_PACKAGE_ROOT ? createRequire(join(process.env.DSH_PACKAGE_ROOT, 'package.json')) : createRequire(import.meta.url)
@@ -207,11 +268,13 @@ test('current host without legacy connection publishes approvals and cancels car
   ctx.provide('webApp', { getAdvertisedUrl: () => 'http://127.0.0.1:3080/' })
   await ctx.plugin(runtime.ApprovalService, { policy: 'ask' }).inertia
   await ctx.plugin(UserQuestionService).inertia
-  let nativeCalls = 0
-  ctx.on('user-questions/request', () => {
-    nativeCalls += 1
-    return answer
+  const nativeRequests = []
+  const native = request => new Promise((resolve, reject) => {
+    nativeRequests.push({ request, resolve })
+    request.signal.addEventListener('abort', () => reject(Object.assign(new Error('dismissed'), { code: 'ASK_ABORTED' })), { once: true })
   })
+  ctx.on('user-questions/request', native)
+  ctx.on('approval/request', native)
   const host = ctx.plugin(plugin, { socketPath: path })
   await host.inertia
   await until(() => hooks.some(hook => hook.web_focus_socket))
@@ -219,7 +282,7 @@ test('current host without legacy connection publishes approvals and cancels car
   const observer = await observe(endpoint)
   t.after(() => observer.socket.destroy())
   session.append('turn/start', { turn: 1 })
-  for (const decision of ['allowed-once', 'rejected', 'cancelled', 'never']) {
+  for (const decision of ['allowed-once', 'rejected', 'cancelled', 'native-allowed-once', 'native-rejected', 'never']) {
     const callId = `approval-${decision}`
     const signal = new AbortController()
     const count = observer.frames.filter(frame => frame.interaction?.status === 'pending').length
@@ -232,13 +295,48 @@ test('current host without legacy connection publishes approvals and cancels car
       assert.equal(pending.kind, 'approval')
       assert.equal(pending.tool_name, 'write')
       assert.equal(pending.turn_id, 1)
+      const native = nativeRequests.filter(item => item.request.callId === callId)
+      assert.equal(native.length, 1)
+      assert.notEqual(native[0].request.signal, signal.signal)
       if (decision === 'cancelled') signal.abort()
+      else if (decision.startsWith('native-')) native[0].resolve(decision.slice(7))
       else assert.deepEqual(await command(endpoint, { type: 'respond_interaction', observer_id: observer.observerID,
         session_id: session.id, request_id: pending.request_id, decision }), { ok: true })
-    }
-    assert.equal(await waiting, decision === 'never' ? 'rejected' : decision)
+      assert.equal(await waiting, decision.startsWith('native-') ? decision.slice(7) : decision)
+      assert.equal(native[0].request.signal.aborted, true)
+      assert.equal(signal.signal.aborted, decision === 'cancelled')
+      assert.equal((await command(endpoint, { type: 'respond_interaction', observer_id: observer.observerID,
+        session_id: session.id, request_id: pending.request_id, decision: 'allowed-once' })).error, 'stale-request')
+    } else assert.equal(await waiting, 'rejected')
     if (decision === 'never') {
       assert.equal(observer.frames.filter(frame => frame.interaction?.status === 'pending').length, count)
+    }
+  }
+  for (const kind of ['question', 'plan']) {
+    for (const winner of ['native', 'island']) {
+      const callId = `${kind}-${winner}`
+      const items = kind === 'plan' ? [{ id: 'plan-review', question: 'Review plan', detail: '# Exact plan',
+        options: [{ label: 'Approve' }, { label: 'Keep planning' }], intent: { kind: 'plan-review', approve: 'Approve', callId } }] : questions
+      const expected = kind === 'plan' ? { answers: [{ id: 'plan-review', selected: ['Keep planning'], custom: 'revise' }] } : answer
+      const tool = kind === 'plan' ? 'exit_plan_mode' : 'ask_user_question'
+      session.append('tool/call', { turn: 1, step: 1, callId, name: tool, arguments: '{}' })
+      const signal = new AbortController()
+      const waiting = ctx.userQuestions.ask(Object.freeze({ agent, questions: items, signal: signal.signal }))
+      await until(() => observer.frames.some(frame => frame.interaction?.call_id === callId))
+      const card = observer.frames.find(frame => frame.interaction?.call_id === callId).interaction
+      const native = nativeRequests.at(-1)
+      assert.equal(native.request.agent, agent)
+      assert.equal(native.request.questions, items)
+      if (winner === 'native') native.resolve(expected)
+      else assert.deepEqual(await command(endpoint, { type: 'respond_interaction', observer_id: observer.observerID,
+        session_id: session.id, request_id: card.request_id, ...expected }), { ok: true })
+      assert.deepEqual(await waiting, expected)
+      assert.equal(signal.signal.aborted, false)
+      assert.equal(native.request.signal.aborted, true)
+      assert.equal((await command(endpoint, { type: 'respond_interaction', observer_id: observer.observerID,
+        session_id: session.id, request_id: card.request_id, ...expected })).error, 'stale-request')
+      session.append('tool/result', { turn: 1, step: 1, message: { id: `result-${callId}`, role: 'tool',
+        source: { kind: 'tool', callId }, toolCallId: callId, content: [] } }, { surfaceOp: 'append' })
     }
   }
   session.append('tool/call', { turn: 1, step: 1, callId: 'actual-question-call', name: 'ask_user_question', arguments: JSON.stringify({ questions }) })
@@ -255,10 +353,11 @@ test('current host without legacy connection publishes approvals and cancels car
   const unloading = ctx.userQuestions.ask({ agent, questions })
   const unloaded = unloading.then(value => ({ value }), error => ({ error }))
   await until(() => observer.frames.filter(frame => frame.interaction?.status === 'pending'
-    && frame.interaction.kind === 'question').length === 2)
+    && frame.interaction.kind === 'question').length === 4)
   await host.dispose()
   assert.equal((await unloaded).error.code, 'ASK_ABORTED')
-  assert.equal(nativeCalls, 0)
+  assert.equal(nativeRequests.filter(item => item.request.questions).length, 6)
+  assert.ok(nativeRequests.every(item => item.request.signal.aborted))
 })
 
 test('published DSH services preserve native waterfall fallback, approval audit ordering and never policy', {

@@ -413,7 +413,7 @@ The host plugin advertises a credential-free `web_origin` and a private `web_foc
 
 ### Questions, plan reviews, and approval requests
 
-The host prepends supported public `user-questions/request` and `approval/request` waterfall listeners. A new live root-agent request is claimed only while one native Open Island observer holds a healthy private-socket lease. If there is no observer, the request is unsupported, or the lease disconnects, ownership is revoked before the waterfall continues to DSH's native handler. Open Island never races a second answerer against the DSH UI.
+The host prepends supported public `user-questions/request` and `approval/request` waterfall listeners. While one Open Island observer holds a healthy private-socket lease, supported live root-agent requests appear in both DSH and Open Island. One settlement gate accepts the first answer, revokes the other card, and rejects stale responses. A private cancellation signal dismisses DSH's presentation when Open Island answers without changing the caller's signal. Unsupported requests and requests without an observer keep DSH's normal behavior. Losing the companion revokes its request IDs but retains the existing native wait instead of dispatching another prompt.
 
 - User questions become `questionAsked` cards. Native question IDs, multiselect arrays, comma-containing labels, custom replies, and duplicate visible question text are preserved without parsing display prose.
 - `exit_plan_mode` uses the same question flow with its full markdown detail and exact `plan-review` intent. Approve and Keep planning are explicit choices. Custom feedback is returned unchanged. Approving a plan does not grant tool permissions or force a mode transition outside DSH's own controller.

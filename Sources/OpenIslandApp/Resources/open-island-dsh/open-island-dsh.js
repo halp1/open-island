@@ -420,10 +420,11 @@ export async function createFocusRelay({ hasSession, interactions, timeoutMs = 5
   }
 }
 
-// Own exactly one answerer at a time. Losing the native observer first revokes
-// all request IDs, then delegates to the original DSH waterfall. Never race next().
+// Keep DSH and Open Island visible under one settlement. The first answer
+// revokes the other surface. Observer loss retains the existing native wait.
 export function createInteractionController({ isLive, callIdFor, turnIdFor, pingMs = 1000, leaseMs = 4000 } = {}) {
   const pending = new Map()
+  const active = new Set()
   let observer
   let disposed = false
   const aborted = () => Object.assign(new Error('Question lifetime ended'), { name: 'UserQuestionError', code: 'ASK_ABORTED' })
@@ -446,13 +447,22 @@ export function createInteractionController({ isLive, callIdFor, turnIdFor, ping
       interaction: { ...presentation, status, ...(resolution ? { resolution } : {}) } })
   }
   function finish(entry, action, value) {
-    if (pending.get(entry.presentation.request_id) !== entry) return
-    pending.delete(entry.presentation.request_id)
-    entry.signal?.removeEventListener('abort', entry.abort)
-    if (!publish(entry, 'resolved', action) && observer) detach(observer)
-    // Promise scheduling prevents a downstream handler from running before every
-    // stale ID has been revoked during observer shutdown.
-    if (action === 'delegate') Promise.resolve().then(entry.next).then(entry.resolve, entry.reject)
+    if (!active.has(entry) || (action === 'delegate' && entry.delegated)) return
+    const visible = pending.delete(entry.presentation.request_id)
+    if (action === 'delegate') entry.delegated = true
+    else {
+      active.delete(entry)
+      entry.signal?.removeEventListener('abort', entry.abort)
+    }
+    if (visible && !publish(entry, 'resolved', action) && observer) detach(observer)
+    if (action === 'delegate') {
+      // Revoke the Island ID but retain the same DSH wait and its lifecycle.
+      const native = entry.nativeResult ?? Promise.resolve().then(entry.next)
+      native.then(value => finish(entry, 'native', value), error => finish(entry, 'native-error', error))
+      return
+    }
+    entry.nativeAbort?.abort()
+    if (action === 'native-error') entry.reject(value)
     else if (action === 'cancelled') {
       if (entry.presentation.kind === 'approval') entry.resolve('cancelled')
       else entry.reject(aborted())
@@ -531,11 +541,11 @@ export function createInteractionController({ isLive, callIdFor, turnIdFor, ping
       ...(question.intent === undefined ? {} : { intent: { ...question.intent } }),
     }))
   }
-  function request(kind, req, next) {
+  function request(kind, req, next, dispatchNative) {
     const session = req.agent?.session
     // Timed waits need a separate public attachWait claim. This slice deliberately
     // leaves their existing countdown and late-answer UI in native DSH.
-    if (disposed || !observer || pending.size >= 128 || !session || !isLive(req.agent) || req.wait?.timed === true) return next()
+    if (disposed || !observer || active.size >= 128 || !session || !isLive(req.agent) || req.wait?.timed === true) return next()
     if (req.signal?.aborted) return kind === 'approval' ? Promise.resolve('cancelled') : Promise.reject(aborted())
     let presentation
     if (kind === 'approval') {
@@ -557,8 +567,23 @@ export function createInteractionController({ isLive, callIdFor, turnIdFor, ping
       const entry = { session, agent: req.agent, presentation, next, resolve, reject, signal: req.signal }
       entry.abort = () => finish(entry, 'cancelled')
       pending.set(presentation.request_id, entry)
+      active.add(entry)
       req.signal?.addEventListener('abort', entry.abort, { once: true })
       if (req.signal?.aborted) return entry.abort()
+      if (dispatchNative) {
+        entry.nativeAbort = new AbortController()
+        const signal = AbortSignal.any([entry.nativeAbort.signal, ...(req.signal ? [req.signal] : [])])
+        // Clone the borrowed request instead of mutating its readonly signal.
+        entry.nativeResult = Promise.resolve().then(() => dispatchNative({ ...req, signal }))
+        entry.nativeResult.then(value => {
+          // An absent native answerer must not preempt an available companion.
+          if (kind === 'approval' ? !['allowed-once', 'rejected', 'cancelled'].includes(value) : !answerBatch(value)) return
+          finish(entry, 'native', value)
+        }, error => {
+          // Transport failure or no provider is not a human decision.
+          if (cancellationCodes.has(error?.code)) finish(entry, 'native-error', error)
+        })
+      }
       if (!publish(entry, 'pending')) detach(observer)
     })
   }
@@ -601,11 +626,11 @@ export function createInteractionController({ isLive, callIdFor, turnIdFor, ping
     attach, respond,
     request,
     cancelSession(session) {
-      for (const entry of [...pending.values()]) if (entry.session === session) finish(entry, 'cancelled')
+      for (const entry of [...active]) if (entry.session === session) finish(entry, 'cancelled')
     },
     cancelCall(session, callId) {
       if (!validId(callId)) return
-      for (const entry of [...pending.values()]) if (entry.session === session && entry.presentation.call_id === callId) finish(entry, 'cancelled')
+      for (const entry of [...active]) if (entry.session === session && entry.presentation.call_id === callId) finish(entry, 'cancelled')
     },
     close() {
       disposed = true
@@ -646,7 +671,21 @@ export function apply(ctx, config = {}) {
     callIdFor,
     turnIdFor: session => sessions.get(session)?.turnId,
   })
-  ctx.on('user-questions/request', async (request, next) => {
+  const nativeRequests = new WeakSet()
+  async function dispatchNative(receiver, event, request) {
+    nativeRequests.add(request)
+    try {
+      const unavailable = () => event === 'approval/request' ? Promise.resolve('unavailable')
+        : Promise.reject(Object.assign(new Error('No DSH question answerer'), { name: 'UserQuestionError', code: 'NO_PROVIDER' }))
+      // Preserve DSH's scoped receiver and cancellation contract. Re-entering
+      // with our private marker skips only this companion middleware.
+      return await ctx.waterfall(receiver, event, request, unavailable)
+    } finally {
+      nativeRequests.delete(request)
+    }
+  }
+  ctx.on('user-questions/request', async function(request, next) {
+    if (nativeRequests.has(request)) return next()
     if (request.agent?.session) start(request.agent.session)
     const state = sessions.get(request.agent?.session)
     const question = request.questions?.length === 1 ? request.questions[0] : undefined
@@ -658,7 +697,8 @@ export function apply(ctx, config = {}) {
     try {
       // Observe the original answer regardless of which answerer owns the UI.
       // Returning this exact value preserves native validation and error behavior.
-      const answer = await interactions.request('question', request, next)
+      const answer = await interactions.request('question', request, next,
+        native => dispatchNative(this, 'user-questions/request', native))
       if (observation) {
         const answers = answerBatch(answer)
         const matching = answers && Array.isArray(request.questions)
@@ -677,9 +717,11 @@ export function apply(ctx, config = {}) {
       throw error
     }
   }, { prepend: true })
-  ctx.on('approval/request', (request, next) => {
+  ctx.on('approval/request', function(request, next) {
+    if (nativeRequests.has(request)) return next()
     if (request.agent?.session) start(request.agent.session)
-    return interactions.request('approval', request, next)
+    return interactions.request('approval', request, next,
+      native => dispatchNative(this, 'approval/request', native))
   }, { prepend: true })
 
   // The interaction socket needs only the host's public WebApp service.

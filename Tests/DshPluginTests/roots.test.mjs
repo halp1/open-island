@@ -171,9 +171,11 @@ test('published registry excludes children before and after registration, suppre
   await until(() => frames.some(frame => frame.interaction?.status === 'pending'))
   const pending = frames.find(frame => frame.interaction?.status === 'pending')
   assert.equal(pending.session_id, root.id)
-  assert.deepEqual(await command(endpoint, { type: 'respond_interaction', observer_id: observerID,
-    session_id: root.id, request_id: pending.interaction.request_id, ...answer }), { ok: true })
+  // The native answerer answered first, so its Island counterpart is stale.
   assert.deepEqual(await rootQuestion, answer)
+  assert.deepEqual(await command(endpoint, { type: 'respond_interaction', observer_id: observerID,
+    session_id: root.id, request_id: pending.interaction.request_id, ...answer }), { ok: false, error: 'stale-request' })
+  assert.equal(nativeQuestions, children.length + 2)
   await until(() => hooks.filter(hook => hook.is_subagent === true).length === children.length + 1)
   await delay(45)
   const childHooks = hooks.filter(hook => hook.session_id !== root.id)
