@@ -1786,8 +1786,9 @@ private struct IslandSessionRow: View {
         VStack(alignment: .leading, spacing: 0) {
             if !completionMessageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 AutoHeightScrollView(maxHeight: 160) {
-                    Markdown(completionMessageText)
+                    Markdown(LaTeXMarkdownPreprocessor.preprocess(completionMessageText))
                         .markdownTheme(.completionCard)
+                        .markdownInlineImageProvider(LaTeXInlineImageProvider.shared)
                         .frame(maxWidth: .infinity, alignment: .topLeading)
                         .padding(.horizontal, 14)
                         .padding(.vertical, 9)
@@ -2203,10 +2204,10 @@ private struct StructuredQuestionPromptView: View {
 
             if let detail = question.detail, !detail.isEmpty {
                 AutoHeightScrollView(maxHeight: 180) {
-                    Markdown(detail)
+                    Markdown(LaTeXMarkdownPreprocessor.preprocess(detail))
                         .markdownTheme(.completionCard)
                         .markdownImageProvider(.asset)
-                        .markdownInlineImageProvider(.asset)
+                        .markdownInlineImageProvider(LaTeXInlineImageProvider.shared)
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.vertical, 4)
@@ -2777,45 +2778,49 @@ extension MarkdownUI.Theme {
             BackgroundColor(.white.opacity(0.08))
         }
         .codeBlock { configuration in
-            configuration.label
-                .markdownTextStyle {
-                    FontFamilyVariant(.monospaced)
-                    FontSize(12.5)
-                    ForegroundColor(.white.opacity(0.88))
-                }
-                .padding(10)
-                .background(Color.white.opacity(0.08))
-                .clipShape(RoundedRectangle(cornerRadius: 6))
+            if configuration.language == "math" || configuration.language == "latex" {
+                AnyView(LaTeXDisplayBlock(latex: configuration.content))
+            } else {
+                AnyView(configuration.label
+                    .markdownTextStyle {
+                        FontFamilyVariant(.monospaced)
+                        FontSize(12.5)
+                        ForegroundColor(.white.opacity(0.88))
+                    }
+                    .padding(10)
+                    .background(Color.white.opacity(0.08))
+                    .clipShape(RoundedRectangle(cornerRadius: 6)))
+            }
         }
         .heading1 { configuration in
-            configuration.label
+            AnyView(configuration.label
                 .markdownTextStyle {
                     FontSize(16)
                     FontWeight(.bold)
                     ForegroundColor(.white.opacity(0.88))
                 }
-                .markdownMargin(top: 8, bottom: 4)
+                .markdownMargin(top: 8, bottom: 4))
         }
         .heading2 { configuration in
-            configuration.label
+            AnyView(configuration.label
                 .markdownTextStyle {
                     FontSize(15)
                     FontWeight(.bold)
                     ForegroundColor(.white.opacity(0.88))
                 }
-                .markdownMargin(top: 8, bottom: 4)
+                .markdownMargin(top: 8, bottom: 4))
         }
         .heading3 { configuration in
-            configuration.label
+            AnyView(configuration.label
                 .markdownTextStyle {
                     FontSize(14)
                     FontWeight(.semibold)
                     ForegroundColor(.white.opacity(0.88))
                 }
-                .markdownMargin(top: 6, bottom: 2)
+                .markdownMargin(top: 6, bottom: 2))
         }
         .blockquote { configuration in
-            configuration.label
+            AnyView(configuration.label
                 .markdownTextStyle {
                     ForegroundColor(.white.opacity(0.6))
                     FontSize(13.5)
@@ -2825,23 +2830,23 @@ extension MarkdownUI.Theme {
                     Rectangle()
                         .fill(Color.white.opacity(0.2))
                         .frame(width: 3)
-                }
+                })
         }
         .listItem { configuration in
-            configuration.label
-                .markdownMargin(top: 2, bottom: 2)
+            AnyView(configuration.label
+                .markdownMargin(top: 2, bottom: 2))
         }
         .table { configuration in
-            configuration.label
+            AnyView(configuration.label
                 .fixedSize(horizontal: false, vertical: true)
                 .markdownTableBorderStyle(.init(.allBorders, color: .white.opacity(0.15), strokeStyle: .init(lineWidth: 1)))
                 .markdownTableBackgroundStyle(
                     .alternatingRows(Color.white.opacity(0.04), Color.white.opacity(0.08))
                 )
-                .markdownMargin(top: 4, bottom: 8)
+                .markdownMargin(top: 4, bottom: 8))
         }
         .tableCell { configuration in
-            configuration.label
+            AnyView(configuration.label
                 .markdownTextStyle {
                     if configuration.row == 0 {
                         FontWeight(.semibold)
@@ -2850,7 +2855,7 @@ extension MarkdownUI.Theme {
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.vertical, 6)
                 .padding(.horizontal, 12)
-                .relativeLineSpacing(.em(0.25))
+                .relativeLineSpacing(.em(0.25)))
         }
 }
 

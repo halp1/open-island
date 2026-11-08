@@ -29,6 +29,7 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/gonzalezreal/swift-markdown-ui", from: "2.4.1"),
         .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.9.0"),
+        .package(url: "https://github.com/mgriebling/SwiftMath", from: "1.7.3"),
     ],
     targets: [
         .target(
@@ -48,6 +49,7 @@ let package = Package(
                 "OpenIslandCore",
                 .product(name: "MarkdownUI", package: "swift-markdown-ui"),
                 .product(name: "Sparkle", package: "Sparkle"),
+                "SwiftMath",
             ],
             resources: [
                 .process("Resources"),
@@ -59,7 +61,11 @@ let package = Package(
         ),
         .testTarget(
             name: "OpenIslandAppTests",
-            dependencies: ["OpenIslandApp", "OpenIslandCore"]
+            dependencies: [
+                "OpenIslandApp",
+                "OpenIslandCore",
+                "SwiftMath",
+            ]
         ),
     ]
 )
