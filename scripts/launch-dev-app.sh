@@ -122,15 +122,18 @@ EOF
 # Bundle.module falls back to the hardcoded .build/ path, so
 # localization still works. (Release builds use package-app.sh which
 # has its own resource bundle handling.)
-resource_bundle_name="OpenIsland_OpenIslandApp.bundle"
-root_bundle="$bundle_dir/$resource_bundle_name"
-resources_bundle="$bundle_dir/Contents/Resources/$resource_bundle_name"
-if [ -d "$root_bundle" ] && [ ! -L "$root_bundle" ]; then
-    rm -rf "$resources_bundle"
-    mv "$root_bundle" "$resources_bundle"
-fi
-# Remove stale symlinks from previous runs.
-[ -L "$root_bundle" ] && rm -f "$root_bundle"
+for bundle in "$build_root"/*.bundle; do
+    if [ -d "$bundle" ]; then
+        bundle_name="$(basename "$bundle")"
+        resources_bundle="$bundle_dir/Contents/Resources/$bundle_name"
+        rm -rf "$resources_bundle"
+        cp -R "$bundle" "$resources_bundle"
+    fi
+done
+# Remove stale symlinks or bundles from previous runs at the app root.
+for bundle in "$bundle_dir"/*.bundle; do
+    [ -e "$bundle" ] && rm -rf "$bundle"
+done
 
 # Detect a local stable signing identity so the dev bundle's cdhash
 # stays stable across rebuilds and macOS TCC grants (Accessibility,

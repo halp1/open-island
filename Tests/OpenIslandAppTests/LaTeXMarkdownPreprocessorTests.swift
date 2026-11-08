@@ -53,6 +53,13 @@ final class LaTeXMarkdownPreprocessorTests: XCTestCase {
         XCTAssertEqual(input, output)
     }
 
+    func testEinsteinEquation() {
+        let text = "The Einstein field equation is $G_{\\mu\\nu} + \\Lambda g_{\\mu\\nu} = \\frac{8\\pi G}{c^4} T_{\\mu\\nu}$."
+        let preprocessed = LaTeXMarkdownPreprocessor.preprocess(text)
+        print("Preprocessed Einstein:", preprocessed)
+        XCTAssertTrue(preprocessed.contains("latex://inline/"))
+    }
+
     @MainActor
     func testLaTeXRendererValidMath() {
         let image = LaTeXRenderer.render(latex: "\\frac{a}{b}", fontSize: 14, textColor: .white)

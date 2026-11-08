@@ -73,15 +73,14 @@ else
     echo "WARNING: Sparkle.framework not found at $sparkle_framework — run 'swift package resolve' first." >&2
 fi
 
-# Copy SPM resource bundle into Contents/Resources/ so the .app root stays
+# Copy SPM resource bundles into Contents/Resources/ so the .app root stays
 # clean for code signing (no unsealed contents). Our custom
 # resource_bundle_accessor.swift searches Bundle.main.resourceURL first.
-spm_resource_bundle="$build_bin_dir/OpenIsland_OpenIslandApp.bundle"
-if [[ -d "$spm_resource_bundle" ]]; then
-    cp -R "$spm_resource_bundle" "$bundle_dir/Contents/Resources/"
-else
-    echo "WARNING: SPM resource bundle not found at $spm_resource_bundle — app may crash on launch." >&2
-fi
+for bundle in "$build_bin_dir"/*.bundle; do
+    if [[ -d "$bundle" ]]; then
+        cp -R "$bundle" "$bundle_dir/Contents/Resources/"
+    fi
+done
 
 chmod +x \
     "$bundle_dir/Contents/MacOS/OpenIslandApp" \
