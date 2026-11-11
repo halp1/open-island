@@ -9,7 +9,7 @@ Keep all work incremental, reviewable, and reversible. Every meaningful round of
 ## Required Workflow
 
 1. Start each round by checking the current repository state with `git status -sb`.
-2. Enter a topic worktree on a feature branch before editing. Do not edit files directly in the shared `main` worktree.
+2. Switch to a feature branch in this checkout before editing. Do not commit directly on `main`.
 3. Read the relevant files before editing. Do not guess repository structure or behavior.
 4. Keep each round focused on a single coherent change.
 5. After making changes, run the most relevant verification available for that round.
@@ -41,24 +41,16 @@ Keep all work incremental, reviewable, and reversible. Every meaningful round of
 - Add documentation when making architectural or workflow decisions.
 - Prefer native macOS and Swift-friendly project structure for this repository.
 
-## Branching And Worktree Rules
+## Branching Rules
 
-- Treat `/Users/wangruobing/Personal/open-island` on `main` as the shared integration worktree.
-- Never edit, commit, or push directly on `main`. All changes must go through a feature branch and PR before integration.
-- Use the shared `main` worktree only to inspect repository state, fetch, update with `git pull --ff-only`, and run final verification after PRs merge.
-- Create one worktree per branch and one branch per worktree. Never attach two worktrees to the same branch.
-- Create new worktrees from `origin/main`, not from a locally drifted feature branch.
-- Use sibling worktree paths named like `/Users/wangruobing/Personal/open-island-<topic>`.
+- Work directly in this checkout. Do not create sibling or extra git worktrees.
+- Never commit or push directly on `main`. All changes go through a feature branch and PR.
+- Branch from an up-to-date `main` (`git pull --ff-only` first).
 - Use branch names that match the workstream, such as `feat/<topic>`, `fix/<topic>`, `docs/<topic>`, or `investigate/<topic>`.
-- Keep each worktree focused on one coherent slice with a narrow file ownership area when possible.
 - Rebase or merge the latest `origin/main` into the feature branch before integrating it back.
-- Integrate completed work through a PR targeting `main`, then update the shared `main` worktree with `git pull --ff-only`.
 - PRs are ready-for-review by default unless explicitly requested as draft or clearly marked WIP.
-- Remove merged worktrees and delete merged branches after the integration round is complete.
-- If multiple agents are working in parallel, assign each agent its own worktree instead of sharing one checkout.
+- Delete merged branches after the integration round is complete.
 - All PRs must target `main`. Do not chain PRs through another feature branch unless the user explicitly requests that structure.
-
-See [docs/worktree-workflow.md](/Users/wangruobing/Personal/open-island/docs/worktree-workflow.md) for the concrete commands and lifecycle.
 
 ## Product Boundaries
 
