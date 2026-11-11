@@ -163,7 +163,11 @@
 "setup.diagnostics.allHealthy" = "所有 Hooks 運作正常。";
 
 /* Settings - Placeholder */
-"settings.shortcuts.comingSoon" = "快捷鍵設定即將推出。";
+"settings.shortcuts.approve" = "核准最新請求";
+"settings.shortcuts.record" = "錄製快捷鍵";
+"settings.shortcuts.recording" = "請按下快捷鍵…";
+"settings.shortcuts.clear" = "清除快捷鍵";
+"settings.shortcuts.unavailable" = "此快捷鍵已被其他應用程式佔用。";
 "settings.lab.comingSoon" = "實驗性功能即將推出。";
 
 /* Settings - About */

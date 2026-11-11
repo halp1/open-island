@@ -26,6 +26,7 @@ final class AppModel {
     private static let showCodexUsageDefaultsKey = "app.showCodexUsage"
     private static let completionReplyEnabledDefaultsKey = "feature.completionReply.enabled"
     private static let suppressFrontmostNotificationsDefaultsKey = "app.suppressFrontmostNotifications"
+    private static let approveShortcutDefaultsKey = "shortcuts.approve"
     private static let legacyIslandSessionStateIndicatorDefaultsKey = "appearance.island.v8.stateIndicator"
     private static let legacyIslandSessionGroupDefaultsKey = "appearance.island.v8.sessionGroup"
     private static let legacyIslandSessionSortDefaultsKey = "appearance.island.v8.sessionSort"
@@ -321,6 +322,37 @@ final class AppModel {
             UserDefaults.standard.set(suppressFrontmostNotifications, forKey: Self.suppressFrontmostNotificationsDefaultsKey)
         }
     }
+    /// System-wide shortcut that approves the most recent pending approval.
+    /// Nil means unassigned.
+    var approveShortcut: HotKeyShortcut? {
+        didSet {
+            guard approveShortcut != oldValue else { return }
+            if hasFinishedInit {
+                if let approveShortcut, let data = try? JSONEncoder().encode(approveShortcut) {
+                    UserDefaults.standard.set(data, forKey: Self.approveShortcutDefaultsKey)
+                } else {
+                    UserDefaults.standard.removeObject(forKey: Self.approveShortcutDefaultsKey)
+                }
+            }
+            approveShortcutRegistrationFailed = !approveHotKey.register(approveShortcut)
+        }
+    }
+    private(set) var approveShortcutRegistrationFailed = false
+
+    /// Releases the hot key while the recorder listens, so pressing the
+    /// current combination records it instead of approving something.
+    func setApproveShortcutSuspended(_ suspended: Bool) {
+        if suspended {
+            approveHotKey.unregister()
+        } else {
+            approveShortcutRegistrationFailed = !approveHotKey.register(approveShortcut)
+        }
+    }
+    @ObservationIgnored
+    private lazy var approveHotKey = GlobalHotKey { [weak self] in
+        self?.approveMostRecentRequest()
+    }
+
     var launchAtLoginEnabled: Bool = false {
         didSet {
             guard !isApplyingLaunchAtLogin, hasFinishedInit, launchAtLoginEnabled != oldValue else { return }
@@ -678,6 +710,8 @@ final class AppModel {
             )
         }
         completionReplyEnabled = UserDefaults.standard.bool(forKey: Self.completionReplyEnabledDefaultsKey)
+        approveShortcut = UserDefaults.standard.data(forKey: Self.approveShortcutDefaultsKey)
+            .flatMap { try? JSONDecoder().decode(HotKeyShortcut.self, from: $0) }
         launchAtLoginEnabled = LaunchAtLoginService.shared.isEnabled
         appearanceSettingsProfile = IslandAppearanceDisplayProfile(
             rawValue: UserDefaults.standard.string(forKey: Self.appearanceProfileSettingsDefaultsKey) ?? ""
@@ -1388,6 +1422,19 @@ final class AppModel {
                 ? "Approving permission for \(session.title)."
                 : "Denying permission for \(session.title)."
         )
+    }
+
+    /// Approves the newest pending permission or plan review. Plain
+    /// questions are skipped because they have no single approving answer.
+    func approveMostRecentRequest() {
+        switch state.mostRecentApprovalTarget {
+        case let .permission(sessionID, requestID):
+            approvePermission(for: sessionID, action: .allowOnce, requestID: requestID)
+        case let .approvalPrompt(sessionID, requestID, response):
+            answerQuestion(for: sessionID, answer: response, requestID: requestID)
+        case nil:
+            lastActionMessage = "No pending approval."
+        }
     }
 
     func answerFocusedQuestion(_ answer: String) {

@@ -283,6 +283,9 @@ public struct QuestionPromptItem: Equatable, Codable, Sendable {
     public var multiSelect: Bool
     public var nativeID: String?
     public var detail: String?
+    /// Option label that approves this item, when the agent marked it as an
+    /// approval (for example a plan review). Plain questions leave it nil.
+    public var approveOption: String?
 
     public var responseKey: String { nativeID ?? question }
 
@@ -292,7 +295,8 @@ public struct QuestionPromptItem: Equatable, Codable, Sendable {
         options: [QuestionOption],
         multiSelect: Bool = false,
         nativeID: String? = nil,
-        detail: String? = nil
+        detail: String? = nil,
+        approveOption: String? = nil
     ) {
         self.question = question
         self.header = header
@@ -300,6 +304,7 @@ public struct QuestionPromptItem: Equatable, Codable, Sendable {
         self.multiSelect = multiSelect
         self.nativeID = nativeID
         self.detail = detail
+        self.approveOption = approveOption
     }
 }
 

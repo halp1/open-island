@@ -163,7 +163,11 @@
 "setup.diagnostics.allHealthy" = "All hooks are healthy.";
 
 /* Settings - Placeholder */
-"settings.shortcuts.comingSoon" = "Keyboard shortcuts coming soon.";
+"settings.shortcuts.approve" = "Approve latest request";
+"settings.shortcuts.record" = "Record Shortcut";
+"settings.shortcuts.recording" = "Type Shortcut…";
+"settings.shortcuts.clear" = "Clear shortcut";
+"settings.shortcuts.unavailable" = "This shortcut is in use by another app.";
 "settings.lab.comingSoon" = "Experimental features coming soon.";
 
 /* Settings - About */

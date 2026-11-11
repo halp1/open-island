@@ -114,7 +114,10 @@ public struct DSHInteraction: Equatable, Codable, Sendable {
                 options: Self.presentationOptions(for: question),
                 multiSelect: question.multiSelect ?? false,
                 nativeID: question.id,
-                detail: question.detail
+                detail: question.detail,
+                approveOption: question.intent.map(\.approve).flatMap { label in
+                    question.options?.contains(where: { $0.label == label }) == true ? label : nil
+                }
             )
         }
         return QuestionPrompt(
